@@ -1,0 +1,54 @@
+{
+  "db_dir": "~/.hermes/data/hermes_kb",
+  "state_db": "~/.hermes/data/hermes_kb/sync_state.sqlite",
+
+  "watch_dirs": [
+    "~/knowledge_base",
+    "~/.hermes/skills"
+  ],
+
+  "embedding": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "batch_size": 12,
+    "timeout": 30
+  },
+
+  "reranker": {
+    "base_url": "https://api.siliconflow.cn/v1/rerank",
+    "api_key": "",
+    "model": "BAAI/bge-reranker-v2-m3"
+  },
+
+  "chunker": {
+    "min_chunk_chars": 200,
+    "max_chunk_chars": 1500,
+    "target_chunk_chars": 800
+  },
+
+  "source_filters": {
+    "exclude_dirs": [".archive", "__pycache__", ".git"],
+    "exclude_file_prefixes": [".tmp", ".usage-", ".usage_"],
+    "exclude_component_substrings": [".rollback-"],
+    "exclude_paths": [],
+    "exclude_path_prefixes": [],
+    "exclude_file_suffixes": [".bak", ".part", ".tmp", ".swp"]
+  },
+
+  "retrieval": {
+    "candidate_limit": 25,
+    "fts_candidate_limit": 20,
+    "rrf_k": 60,
+    "rerank_top_n": 25,
+    "user_top_k": 25,
+    "doing_top_k": 25,
+    "doing_candidate_limit": 25,
+    "min_rerank_score": 0.85,
+    "use_reranker": true,
+    "rank_by": "rrf",
+    "reranker_max_candidates": 25,
+    "max_inject_blocks": 2
+  }
+}

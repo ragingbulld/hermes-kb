@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 知识库数据 —— 绝不提交
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+state_db
+
+# 配置（含密钥）
+config.json
+!config/config.example.json
+
+# 真实笔记/卡片 —— 只有 examples/ 下的示例可提交
+notes/
+reflections/*
+!reflections/README.md
+
+# 编辑器/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 日志
+*.log

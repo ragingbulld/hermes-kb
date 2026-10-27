@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-kb"
+version = "1.0.0"
+description = "Local Markdown knowledge base with agent context injection (SQLite + FTS5 + optional rerank)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "watchdog>=6,<7",
+    "numpy>=2,<3",
+    "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hermes-kb = "hermes_kb.cli:main"
+
+[tool.setuptools]
+packages = ["hermes_kb"]

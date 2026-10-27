@@ -1,0 +1,8 @@
+name: hermes-kb-write
+version: 1.0.0
+description: Main-AI reflection card writer — save_reflection tool with a semantic dedup gate backed by the LanceDB engine
+author: Hermes
+entrypoint: __init__.py
+enabled: true
+provides_tools:
+  - save_reflection

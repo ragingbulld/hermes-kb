@@ -1,0 +1,17 @@
+name: hermes-kb-auto-inject
+version: 0.2.0
+description: "Execution-state-driven SQLite KB chunk retrieval and context injection for Hermes"
+author: "Hermes"
+entrypoint: "__init__.py"
+provides_hooks:
+  - pre_llm_call
+provides_tools:
+  - search_knowledge
+# 官方 PM 会在构建插件运行环境时安装这些依赖（pyproject [project].dependencies 的
+# manifest 等价写法）。必须声明：依赖装在各 install/environment 的独立 venv 里，Hermes
+# 更新换环境时会丢，届时插件会在网关启动那一刻加载失败，而钩子只在进程启动时注册一次，
+# 结果就是注入静默归零（2026-09-30 事故）。
+python_dependencies:
+  - 'watchdog>=6,<7'
+  - 'numpy>=2,<3'
+  - 'requests>=2.32,<3'
