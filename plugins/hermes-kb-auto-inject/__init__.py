@@ -22,6 +22,7 @@ from .plugin_class import KBAutoInjectPlugin, plugin_instance
 from .plugin_common import logger
 from .registration import SEARCH_KB_SCHEMA, search_knowledge_handler
 from .resident import _ensure_core_resident
+from .sandbox import install_sandbox_rpc_scope, install_stub_kb_query_tolerance
 
 __all__ = [
     "register",
@@ -40,6 +41,11 @@ def register(ctx: Any) -> None:
     隔离 request，那条路上的任何修改按设计都不可能持久化。
     """
     _install_schema_guard()
+    # 沙箱侧两件事（必须在门禁装好之后：它们只打标记 / 放宽签名，不放宽判据）：
+    #   · RPC 处理期间打作用域标记 —— 脚本内 `hermes_tools.*` 子调用从此不再被拦
+    #   · 给 stub 签名补可选 kb_query —— 模型照协议写也不撞 TypeError
+    install_sandbox_rpc_scope()
+    install_stub_kb_query_tolerance()
     _ensure_core_resident()
     # toolset 归属必须落在会话实际 enabled 的集合里。`memory` 在 gateway 的冻结
     # launch policy（`session_policy.toolsets`）里不一定存在 —— 那样工具虽然注册成功、

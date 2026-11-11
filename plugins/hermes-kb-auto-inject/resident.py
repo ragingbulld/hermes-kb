@@ -7,7 +7,7 @@
 """
 
 import sys
-from typing import Any, List
+from typing import List
 
 from .plugin_common import logger
 

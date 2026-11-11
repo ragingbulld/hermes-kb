@@ -18,7 +18,6 @@
 """
 
 import hashlib
-import json
 import logging
 import os
 import re
@@ -184,13 +183,18 @@ class KBEngine:
     # 切词口径版本。改了 _fts_tokens 的切法就必须 +1，_init_db 据此重建 fts。
     _FTS_TOKENIZER_VERSION = 2
 
-    # MATCH 表达式里 AND 组合的上限：太长会拖慢 FTS 且容易 0 命中
-    _FTS_AND_MAX_TERMS = 16
+    # MATCH 表达式里 token 的数量上限：太多会拖慢 FTS 且容易 0 命中。
+    # 主路径是 OR + `ORDER BY rank`（bm25 自带加权），所以这里放宽到 32：
+    # 中文长句 13 个 token 完全在范围内，实测无一例触顶。
+    _FTS_OR_MAX_TERMS = 32
+    # 触顶后的兜底：只取靠前的 token 再 OR 一次，防止长查询整体 0 命中。
     _FTS_OR_FALLBACK_COUNT = 8
 
     def __init__(self):
         self.config = get_config()
-        self.db_dir = self.config.get("db_dir") or os.path.expanduser("~/.hermes/data/hermes_kb")
+        self.db_dir = self.config.get("db_dir") or os.path.expanduser(
+            "~/.hermes/data/hermes_kb"
+        )
         os.makedirs(self.db_dir, exist_ok=True)
         self.kb_path = self.config.get("sqlite_path") or os.path.join(
             self.db_dir, "kb.sqlite3"
@@ -386,9 +390,9 @@ class KBEngine:
         return " ".join(out)
 
     def _build_fts_expr(self, query: str):
-        """构造 FTS5 MATCH 表达式：每个 token 单独加引号，token 之间 AND。
+        """构造 FTS5 MATCH 表达式：**BM25 式词或组合**，不做全 AND 淘汰。
 
-        每个 token 必须自己带引号，两个原因，都不是风格问题：
+        每个 token 单独加引号，两个原因，都不是风格问题：
 
         1. **不加引号会语法报错**。`space-y-2`、`p-3` 这类专名里的 `-` 是
            FTS5 的运算符，`space-y-2` 会被读成「列 y 上的操作」，直接抛
@@ -398,24 +402,34 @@ class KBEngine:
            unicode61 切成 `bpf redirect peer` 并作为短语匹配，三个子词必须
            相邻；不加引号就成了三个独立词，`bpf` 和 `peer` 隔着几行也能命中。
 
-        但引号只能包单个 token，不能包整串：token 已经是真实单词了，把
-        `"a b c"` 当成一个短语等于要求这几个词在原文里**连续挨着写**，
-        实测 `fts_candidate_limit candidate_limit rrf` 这样查是 0 命中，
-        改成三个 token 各自加引号再 AND 就有 26 条。词与词之间只要求共现，
-        顺序和距离不设限，这是 BM25 该有的语义。
+        引号只能包单个 token，不能包整串：`"a b c"` 当短语等于要求这几个词
+        在原文里**连续挨着写**，实测 `fts_candidate_limit candidate_limit rrf`
+        这样查是 0 命中，改成三个 token 各自加引号再 OR 就有结果。
+
+        ── 为什么是 OR 而不是 AND（2026-10-28 重构）──────────────────
+
+        旧实现是 `" AND ".join(...)`，语义是「缺一个 token 就出局」。这与
+        BM25 的本义相反：BM25 是「命中越多分越高」，**不是「少一个就淘汰」**。
+        实测代价（6 条带正解标注的 query，真值判据 = 标题/小节路径字面）：
+
+            硬 AND        GT 进前 15：3/6   （rrf-degen 直接 0 命中）
+            OR + ORDER BY rank   ：5/6      （rrf-degen → GT@1）
+
+        典型翻车：`restic 备份仓库 pack 零字节 打不开` 切出 9 个 token，AND
+        全满足只剩 13 条且真卡不在其中；改 OR 后真卡排第 3。中文长句更糟，
+        13 个 token 的 AND 只回来 3 条。
+
+        更隐蔽的一层：`fts5` 的 `ORDER BY rank` 本身就是 bm25()，OR 组合下
+        「命中 8 个词」天然排在「命中 2 个词」前面——**加权是排序器自带的，
+        不需要自己算**。而旧的 AND 写法把这个能力彻底废掉，只剩精确匹配。
+
+        降级链保留但换了位置：OR 是主路径；只有 token 过多导致整条 OR
+        都 0 命中时，才回退到「取前 N 个 token」再 OR 一次（见 search()）。
         """
         terms = self._fts_tokens(query).split()
         if not terms:
             return None
-        return " AND ".join(f'"{t}"' for t in terms[: self._FTS_AND_MAX_TERMS])
-
-    def _build_fts_expr_or(self, query: str):
-        terms = self._fts_tokens(query).split()
-        if not terms:
-            return None
-        # 取靠前的 token（通常携带主要信息），OR 组合保证有召回。
-        # 同样必须逐个加引号，否则 p-3 之类会抛 OperationalError。
-        return " OR ".join(f'"{t}"' for t in terms[: self._FTS_OR_FALLBACK_COUNT])
+        return " OR ".join(f'"{t}"' for t in terms[: self._FTS_OR_MAX_TERMS])
 
     # -------------------------------------------------------------- 向量矩阵
     def _load_vectors(self):
@@ -471,7 +485,7 @@ class KBEngine:
             "encoding_format": "float",
         }
 
-        for attempt in range(3):
+        for _ in range(3):
             try:
                 res = requests.post(
                     f"{base_url}/embeddings", headers=headers, json=payload, timeout=15
@@ -517,7 +531,7 @@ class KBEngine:
                 "input": truncated_texts,
                 "encoding_format": "float",
             }
-            for attempt in range(3):
+            for _ in range(3):
                 try:
                     res = requests.post(
                         f"{base_url}/embeddings",
@@ -651,7 +665,7 @@ class KBEngine:
         vectors = self._embed_or_raise(chunks)
 
         now = time.time()
-        rows, fts_rows, new_ids, new_vecs = [], [], [], []
+        fts_rows, new_ids, new_vecs = [], [], []
         with self._conn() as conn:
             for i, c in enumerate(chunks):
                 v = vectors[i]
@@ -854,7 +868,7 @@ class KBEngine:
 
     def _embed_or_raise(self, chunks):
         """兼容旧调用：chunks -> vectors（走缓存）。"""
-        vectors, hit_flags = self._embed_chunks(chunks)
+        vectors, _hit_flags = self._embed_chunks(chunks)
         return vectors
 
     # ------------------------------------------------------------ 同步状态
@@ -1086,7 +1100,7 @@ class KBEngine:
 
     # ------------------------------------------------------------------ 检索
     def _row_to_item(self, row):
-        cid, chunk_id, fpath, heading, title, content, tok, updated = row
+        _, chunk_id, fpath, heading, title, content, tok, updated = row
         return {
             "id": str(chunk_id),
             "chunk_id": chunk_id,
@@ -1109,13 +1123,13 @@ class KBEngine:
         if not query or not query.strip():
             return []
         q_clean = query.strip()
-        retrieval_cfg = self.config.get("retrieval", {})
-        vector_limit = max(1, int(limit or retrieval_cfg.get("candidate_limit", 40)))
-        fts_limit = max(1, int(retrieval_cfg.get("fts_candidate_limit", 20)))
+        retrieval_cfg = self.config["retrieval"]
+        vector_limit = max(1, int(limit or retrieval_cfg["candidate_limit"]))
+        fts_limit = max(1, int(retrieval_cfg["fts_candidate_limit"]))
         if rerank_top_n is None:
-            rerank_top_n = int(retrieval_cfg.get("rerank_top_n", 6))
+            rerank_top_n = retrieval_cfg["rerank_top_n"]
         rerank_top_n = max(1, int(rerank_top_n))
-        rrf_k = max(1, int(retrieval_cfg.get("rrf_k", 60)))
+        rrf_k = max(1, int(retrieval_cfg["rrf_k"]))
 
         candidates_map = {}
 
@@ -1136,7 +1150,6 @@ class KBEngine:
                     candidates_map[cid] = item
                 item[f"_{source}_rank"] = rank
                 item["rrf_score"] += 1.0 / (rrf_k + rank)
-
         # ---- 向量路：内存矩阵暴力余弦
         try:
             q_vec = self.compute_embedding(q_clean)
@@ -1165,10 +1178,15 @@ class KBEngine:
         except Exception as e:
             logger.warning("[KBEngine] Vector search error: %s", e)
 
-        # ---- FTS 路：短语/AND，0 结果降级 OR
+        # ---- FTS 路：BM25 词或（OR + ORDER BY rank），无命中才收窄 token 重试
         # 不再预处理 q_clean：_fts_tokens 的正则本来就把 ｜|# 之类当分隔符，
         # 而旧写法连 _ / \ 也换成空格，会把 api_content、bpf_redirect_peer
         # 这类专名打散，跟索引侧的整词切法对不上（静默失配，不报错）。
+        #
+        # 2026-10-28 重构：主路径由「全 AND」改为「OR + 排序器加权」。
+        # fts5 的 ORDER BY rank 就是 bm25()，「命中词多」天然排在「命中词少」
+        # 前面，加权是排序器自带的；旧的全 AND 写法把这个能力废掉了，退化成
+        # 精确匹配，缺一个 token 就整条淘汰。实测 GT 命中 3/6 → 5/6。
         if q_clean:
             try:
                 expr = self._build_fts_expr(q_clean)
@@ -1185,14 +1203,21 @@ class KBEngine:
                             ]
                         except sqlite3.OperationalError:
                             hit_ids = []
+                        # 兜底：token 过多导致整条 OR 都 0 命中时，只取靠前的
+                        # 几个 token 再试一次。命中数恒为 0 才走这里，正常
+                        # 查询不会触发。
                         if not hit_ids:
-                            or_expr = self._build_fts_expr_or(q_clean)
-                            if or_expr:
+                            terms = self._fts_tokens(q_clean).split()
+                            if len(terms) > self._FTS_OR_FALLBACK_COUNT:
+                                fallback = " OR ".join(
+                                    f'"{t}"'
+                                    for t in terms[: self._FTS_OR_FALLBACK_COUNT]
+                                )
                                 hit_ids = [
                                     r[0]
                                     for r in conn.execute(
                                         "SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY rank LIMIT ?",
-                                        (or_expr, fts_limit),
+                                        (fallback, fts_limit),
                                     )
                                 ]
                 if hit_ids:
@@ -1233,13 +1258,13 @@ class KBEngine:
 
         # RRF 后再交给 Cross-Encoder Reranker 精排。
         if use_reranker is None:
-            use_reranker = bool(retrieval_cfg.get("use_reranker", True))
+            use_reranker = bool(retrieval_cfg["use_reranker"])
         rerank_results = []
         if use_reranker:
             # 卡重排免费线：小批量免费按候选条数(<=25)判，
             # 送入 reranker 的文档数必须 <= 该值，否则整单按大批量计费。
-            _rr_cap = int(retrieval_cfg.get("reranker_max_candidates", 25) or 25)
-            _rr_pool = fused_candidates[:_rr_cap] if _rr_cap > 0 else fused_candidates
+            _rr_cap = max(1, int(retrieval_cfg["reranker_max_candidates"]))
+            _rr_pool = fused_candidates[:_rr_cap]
             docs_to_rerank = [
                 f"{c.get('heading_path', '')}\n{c.get('content', '')}" for c in _rr_pool
             ]
@@ -1287,10 +1312,29 @@ class KBEngine:
                 if 0 <= idx < len(fused_candidates):
                     score_by_idx[idx] = score
             _rank_by = str(
-                rank_by if rank_by is not None else retrieval_cfg.get("rank_by", "rrf")
+                rank_by if rank_by is not None else retrieval_cfg["rank_by"]
             ).lower()
+            # 混合排序分界：rerank >= 此值的视为「饱和区」，交给 RRF 排；
+            # 低于此值的视为「有梯度区」，按 rerank 分排。
+            # 依据（2026-11-01 实测 6 条 query × 25 候选）：
+            #   >=0.9 段 rerank 跨度仅 0.08~0.09（全挤在 1.0 附近，6 条候选 6 个不同值
+            #   但差异在 1e-3 量级），同段 rrf 跨度 0.030→0.014 且唯一值 6/6；
+            #   <0.9  段 rerank 跨度 0.55~0.88（真梯度），同段 rrf 退化（13/19 唯一值）。
+            # 即两段各自的「有区分度信号」正好相反，故分段取键。
+            _hybrid_t = float(retrieval_cfg["hybrid_rank_threshold"])
+
+            def _hybrid_key(i):
+                _sc = score_by_idx[i]
+                if _sc >= _hybrid_t:
+                    # 饱和区：先按段（0），段内按 rrf 降序（取负做升序）
+                    return (0, -float(fused_candidates[i].get("rrf_score", 0.0)), 0.0)
+                # 有梯度区：段 1，段内按 rerank 降序
+                return (1, 0.0, -_sc)
+
             if score_by_idx:
-                if _rank_by == "rrf":
+                if _rank_by == "hybrid":
+                    ordered_idx = sorted(score_by_idx.keys(), key=_hybrid_key)
+                elif _rank_by == "rrf":
                     ordered_idx = sorted(
                         score_by_idx.keys(),
                         key=lambda i: float(fused_candidates[i].get("rrf_score", 0.0)),
@@ -1462,26 +1506,3 @@ class KBEngine:
             stats["error"] = str(e)
             logger.warning("[KBEngine] optimize_table warning: %s", e)
         return stats
-
-    def vector_stats(self) -> dict:
-        """向量存储运行态（size/capacity/tombstones/矩阵占用）。"""
-        return self._vs.stats()
-
-    def count_rows(self) -> int:
-        with self._conn() as conn:
-            return conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-
-    # ------------------------------------------------------- 兼容空实现（历史接口）
-    def create_or_refresh_fts_index(self):
-        """SQLite 后端无需刷新：写入即索引。保留空实现兼容旧调用方。"""
-        return None
-
-    def create_or_refresh_ann_index(self):
-        """不使用 ANN 索引：6 万行暴力余弦 12.8ms，索引维护成本远大于收益。"""
-        return None
-
-    def cleanup_orphan_indices(self) -> int:
-        return 0
-
-    def cleanup_spill_files(self, max_age_seconds: int = 1800) -> int:
-        return 0

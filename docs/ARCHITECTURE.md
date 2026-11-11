@@ -153,16 +153,20 @@ B 章节讲的是 nginx 反向代理配置与 upstream 负载均衡。
         score(d) = Σ 1 / (k + rank_i(d))       k=60
                         │
                    Rerank 闸门
-        rerank_score < 0.85 → 丢弃
+        rerank_score < min_rerank_score → 丢弃
                         │
-                    按 RRF 分排序
+                  分段取键排序（rank_by=hybrid）
+        rerank >= 0.9 → 按 RRF 分排
+        rerank <  0.9 → 按重排分排
 ```
 
-**为什么按 RRF 排序而不是按重排分排序？**
+**为什么默认不按重排分一路排到底？**
 
 这是踩过的坑。Qwen3-Reranker-8B 在长句上有**分数饱和**：top1 和 top2 的分数可能只差 1e-5（实测 0.9998 vs 0.9997），排序退化成随机。RRF 只用排名位置，天然免疫饱和。
 
-所以重排分的角色是**去噪闸门**（这个块到底相不相关），不是排序依据。`rank_by: "rrf"` 就是这个意思。改成 `"reranker"` 会退回旧行为，效果更差。
+但 RRF 又不认识语义，在分数有梯度的区间里不如重排分。两段的「谁有区分度」正好相反，所以默认 `rank_by: "hybrid"` **分段取键**：`rerank_score >= hybrid_rank_threshold`（默认 0.9）的饱和区按 `rrf_score` 排，低于该线的有梯度区按 `rerank_score` 排。
+
+重排分的**第一角色仍然是去噪闸门**（这个块到底相不相关），闸门只有一个：`min_rerank_score`。用 `rank_by: "rrf"` 可以退回全程按 RRF 排；`"reranker"` 是旧行为（全程按重排分排，高分区会退化成随机）。
 
 ## 五、注入链路
 

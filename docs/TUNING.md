@@ -17,8 +17,8 @@
   },
   "retrieval": {
     "candidate_limit": 25,       // ④ 向量路候选数
-    "min_rerank_score": 0.85,    // ⑤ 去噪闸门 ← 最关键
-    "max_inject_blocks": 2       // ⑥ 单次注入几块
+    "min_rerank_score": 0.65,    // ⑤ 去噪闸门 ← 最关键，也是唯一的合格判定
+    "hybrid_rank_threshold": 0.9 // ⑥ 排序键分界线（rank_by=hybrid 时用）
   }
 }
 ```
@@ -42,19 +42,25 @@
 
 25 是配合 `reranker_max_candidates=25` 的。要调就两个一起调。
 
-### ⑤ `min_rerank_score`（默认 0.85）— 最重要
+### ⑤ `min_rerank_score`（默认 0.65）— 最重要
 
 **这个值决定了「注入的到底是有用知识还是噪声」。**
 
 分数是这个块跟查询的相关度，低于阈值直接丢弃。太低 → 满屏噪声；太高 → 全被丢掉，等于没注入。
 
-**0.85 是 Qwen3-Reranker-8B 上标出来的**，别直接抄到别的模型上。下一节讲怎么标。
+**0.65 是在本机库（bge-reranker-v2-m3）上标出来的**，别直接抄到别的模型上。下一节讲怎么标。
 
-### ⑥ `max_inject_blocks`（默认 2）
+这是**唯一**的合格判定：过了就注入，不过就丢。不要在旁边再叠条数上限、字数熔断、断崖（cliff）第二判据 —— 那会让「阈值说合格」和「实际没注入」分裂成两套口径，排查时无从对齐。
 
-一次注入几张卡的标题。每条卡标题 + 路径 + 行号约 100~150 字符，2 块约 300 字符，成本可忽略。
+### ⑥ `hybrid_rank_threshold`（默认 0.9）
 
-**但别贪多。** 注入 10 条的结果是模型读完发现全是噪声，下次就不看注入了。宁可只给 1~2 条准的。
+只影响**排序**，不影响准入。`rank_by: "hybrid"` 时，`rerank_score >= 0.9` 的饱和区按 `rrf_score` 排，低于该线的有梯度区按 `rerank_score` 排。
+
+这个 0.9 是用 6 条 query × 25 候选实测切的：线以上 rerank 挤在 1.0 附近（跨度仅 0.08，无区分度），线以下跨度 0.55~0.88（有梯度）。换重排模型要重切。
+
+### 关于注入量
+
+注入几条由**过闸门的块数**决定，不再有独立的块数旋钮。嫌注入太多就把 `min_rerank_score` 抬上去，别加第二道闸。
 
 ---
 
@@ -116,7 +122,7 @@ print(f"噪声块  分数：中位={sorted(scores_miss)[len(scores_miss)//2]:.4f
 | 报错原文 | 0.93~0.99 | 0.0~0.5 |
 | 长句描述（30 字以上） | 0.9998 | 0.9997 ← **饱和了，没法区分** |
 
-最后一行就是改 `rank_by: "rrf"` 的原因。**长句查询下重排分失去区分度**，只能靠 RRF 排序、重排分只当粗闸门（0.85 对饱和的分数等于不设闸门，但也无害）。
+最后一行就是默认 `rank_by: "hybrid"` 的原因。**长句查询下重排分失去区分度**，饱和区只能靠 RRF 排序；但线以下有梯度的区间反过来 RRF 更钝，所以按 `hybrid_rank_threshold` 分段取键。无论走哪段，重排分始终是唯一的准入闸门（`min_rerank_score`）。
 
 ---
 
@@ -127,9 +133,8 @@ print(f"噪声块  分数：中位={sorted(scores_miss)[len(scores_miss)//2]:.4f
 | 项 | 量级 |
 |---|---|
 | 每条卡标题清单 | 100~150 字符 |
-| `max_inject_blocks: 2` | 约 300 字符 |
-| `kb_query` 建议词 | 约 200 字符（协议提示词） |
-| 合计（假设一轮 5 次工具调用） | **约 1200~1800 字符 ≈ 600~900 token** |
+| 每次工具调用的 `kb_query` 建议词 | 约 200 字符（协议提示词） |
+| 合计（假设一轮 5 次工具调用） | **视召回条数而定，通常 1000~2000 字符 ≈ 500~1000 token** |
 
 按 deepseek-v4.1-flash 的价格，一天几百轮对话也就几分钱。**这个成本不该成为你调参的约束。**
 
@@ -228,7 +233,7 @@ python3 -c "
 from hermes_kb.config import get_config
 c = get_config()
 print('min_rerank_score =', c['retrieval']['min_rerank_score'])
-print('max_inject_blocks =', c['retrieval']['max_inject_blocks'])
+print('hybrid_rank_threshold =', c['retrieval']['hybrid_rank_threshold'])
 "
 
 # 2. 重启守护进程（引擎侧）
@@ -250,7 +255,7 @@ journalctl -u hermes-gateway -n 100 --no-pager | grep "code md5="
 | 配置读出来是旧值 | 改了错的 `config.json`（有多份备份时容易搞混），或 `HERMES_KB_CONFIG` 指向别处 |
 | 插件 md5 没变 | 只重启了守护进程，没重启网关 |
 | 检索结果没变化 | 结果被缓存了，或改的是 `candidate_limit` 而闸门还是老的 |
-| 注入条数没变 | `max_inject_blocks` 改了但插件进程没重启 |
+| 注入条数没变 | 改的是排序键（`hybrid_rank_threshold`）而不是闸门值，条数由 `min_rerank_score` 决定 |
 
 ---
 

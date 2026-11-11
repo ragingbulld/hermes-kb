@@ -20,7 +20,7 @@ python -m hermes_kb.cli sync   # 看输出
 | 现象 | 原因 | 修法 |
 |---|---|---|
 | `collected 0 files` | `watch_dirs` 路径错 / 不存在 / 无读权限 | `ls` 那个目录；注意 `~` 是否被 shell 展开 |
-| `collected N` 但 `reindexed 0` | 文件 hash 和状态库一致，判定无需重索引 | 正常。想强制重建就删 `state_db` |
+| `collected N` 但 `reindexed 0` | 文件 hash 和状态库一致，判定无需重索引 | 正常。想强制重建就删 `kb.sqlite3` 里的 `file_records` 行（原 `state_db` 键已废弃，状态并进主库） |
 | `reindexed N` 但 `chunks 0` | **文件太短且无标题**，被当成空内容丢弃 | 见下 |
 | `errors: N > 0` | 嵌入 API 报错 | 看日志里的具体错误，通常 401/429/超时 |
 

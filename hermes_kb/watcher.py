@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import hashlib
 import sqlite3
@@ -103,8 +102,8 @@ class KnowledgeWatcher:
         # ---- 路径前缀排除 ----
         # 为什么需要独立字段：`exclude_paths` 是全路径精确匹配，排不掉整棵子树；
         # `exclude_dirs` 按「目录名」匹配，会把两个根下所有同名目录一起排掉
-        # （例如只想跳过 /srv/hermes-kb-inbox/reflections，却连
-        #  其他被软链或重命名的监控目录也一起失效）。
+        # （例如只想跳过 inbox 根下的 reflections，却连 local 根下的 reflections
+        #  也一起失效）。
         # 双根 reflections 是同一批卡的 md5 镜像（写入侧硬性要求双根落盘），
         # 索引只需建一份，否则注入时前 N 块会浪费在同一张卡的两份副本上。
         for prefix in filters.get("exclude_path_prefixes", []):

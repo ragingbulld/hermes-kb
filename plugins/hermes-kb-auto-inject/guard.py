@@ -5,7 +5,6 @@
 `tool_call` 那条延迟桥还要 `unwrap` 递归校验，否则桥里塞的 args 一路裸奔。
 """
 
-from typing import Any
 
 from .plugin_common import (
     KB_FIELD,
@@ -16,6 +15,7 @@ from .plugin_common import (
     _kb_targets,
     _resolve_original,
     _short,
+    in_sandbox_rpc,
     logger,
 )
 from .plugin_class import plugin_instance
@@ -88,11 +88,24 @@ def _install_schema_guard() -> None:
                     KB_FIELD: {
                         "type": "string",
                         "description": (
-                            "要查知识库的词：从这次的工具参数里抄 2~3 个专有名词"
-                            "（产品名/配置键/文件名/命令/报错原文）。"
-                            "只写专名，不加「继续/排查/检查」这类动作词。"
-                            "每次工具调用都要写，且必须是真检索词；"
-                            "none / null / 空串 / 无 这些弃权写法会被打回。"
+                            "检索词。只干一件事：把知识库里那张对的卡捞出来。"
+                            "**不是任务描述，也不是「我要做什么」。**\n"
+                            "写「现在发生了什么」，抄你已经看见的字面 —— "
+                            "报错原文、字段名、参数名、路径、容器名、命令、版本号，"
+                            "原样抄，大小写和 `-` `_` `.` 一个都别改。\n"
+                            "来源只认四处：用户这番话里的产品名/文件名/报错、"
+                            "工具调用参数、工具返回值、本轮读到的文件。\n"
+                            "例：用户说「去掉自动移除」→ 写 "
+                            "`--auto-remove-failed-url Config.Cmd`；"
+                            "用户说「计费对不上」→ 写 "
+                            "`usage_ledger attempts=0 unmatched`。\n"
+                            "**抄之前先自问：这个词可能出现在某张卡的标题或正文里吗？** "
+                            "答不上来就别写 —— 本轮刚生成的临时文件名（`a1.jpg`）、"
+                            "临时变量、本地路径片段，库里永远不会有，写了等于空转。\n"
+                            "也别只写意图：`继续排查检查确认` 这种写完等于没写，"
+                            "意图永远只有那几个词，现象才带信息。\n"
+                            "**你还没看见任何字面就想写检索词，说明该先去看，不是先去检索。**\n"
+                            "每次工具调用都要写；空串 / none / null / 无 会被打回。"
                         ),
                     },
                 }
@@ -138,6 +151,13 @@ def _install_schema_guard() -> None:
         if name == "search_knowledge":
             return search_knowledge_handler(args if isinstance(args, dict) else {})
 
+        if isinstance(args, dict) and in_sandbox_rpc():
+            # execute_code 的 RPC 子调用：整段跳过（理由见 plugin_common.sandbox_rpc_scope）。
+            # 只保留剥离 —— 不剥，底层工具会收到它不认识的 kb_query。
+            for key in _STRIP_KEYS:
+                args.pop(key, None)
+            return original_dispatch(self, name, args, *pos_args, **kwargs)
+
         _kb_attach = ""
         if isinstance(args, dict):
             from tools.registry import tool_error
@@ -163,7 +183,7 @@ def _install_schema_guard() -> None:
                         "`none` / `null` / 空串 / `无` 都会被打回。\n"
                         "抄这条调用自己的参数当检索词：要执行什么，那个名字就是它。\n"
                         "要上一次清单里的正文，直接 `read_file` 那个路径"
-                        "（`read_file` 不是本插件注册的工具，不写 kb_query）。\n"
+                        "（`read_file` 同样要带 kb_query —— 门禁不看工具类型）。\n"
                         "经 tool_call 桥调用时写在 calls[].arguments 内层。",
                         error_type="kb_query_missing",
                         tool=_eff,
@@ -181,11 +201,15 @@ def _install_schema_guard() -> None:
                 return tool_error(
                     f"[kb_query 不可用] 工具 `{_eff}` 的 `kb_query` 必须填真实检索词"
                     f"（现在收到 {_raw!r}）。\n"
-                    "怎么填：看你这次的工具参数，抄 2~3 个专有名词进去\n"
+                    "怎么填：写「现在发生了什么」+ 抄你眼睛已经看见的字面"
+                    "（报错原文/字段名/参数名/路径/容器名/命令/版本号），原样抄别改大小写。\n"
                     "· terminal(command=\"systemctl restart daed\") → `daed systemctl restart`\n"
                     "· read_file(path=\".../xxx/__init__.py\") → `xxx __init__.py`\n"
                     "· 报错原文 bpf_redirect_peer → `bpf_redirect_peer`\n"
-                    "只写专名，别加「继续/排查/检查/确认」这类动作词（那是降分项）。\n"
+                    "只写「继续/排查/检查/确认」这类意图等于没写（意图永远就那几个词，"
+                    "现象才带信息）；但带信息的动词要留，别机械删词。\n"
+                    "本轮刚生成的临时文件名（a1.jpg）、临时变量、本地路径片段别写 —— "
+                    "库里永远不会有，写了等于空转。\n"
                     "弃权写法（none / null / 空串 / 无）不算填了 —— 每一条调用都要真检索。",
                     error_type="kb_query_unusable",
                     tool=_eff,

@@ -144,7 +144,6 @@ cp config/config.example.json ~/.hermes/hermes_kb/config.json
 {
   // 索引数据放哪（会自动创建）
   "db_dir": "~/.hermes/data/hermes_kb",
-  "state_db": "~/.hermes/data/hermes_kb/sync_state.sqlite",
 
   // ⚠️ 最重要：改成你自己的笔记目录，可以有多个
   "watch_dirs": [
@@ -175,9 +174,9 @@ cp config/config.example.json ~/.hermes/hermes_kb/config.json
 
   "retrieval": {
     "candidate_limit": 25,
-    "min_rerank_score": 0.85,    // ⚠️ 换重排模型必须重标，见 TUNING.md
-    "max_inject_blocks": 2,
-    "rank_by": "rrf"             // 别改成 reranker，会因分数饱和退化
+    "min_rerank_score": 0.65,    // ⚠️ 换重排模型必须重标，见 TUNING.md；这是唯一的合格判定
+    "rank_by": "hybrid",         // 分段取键（见 TUNING.md）；别一路用 reranker，会因分数饱和退化
+    "hybrid_rank_threshold": 0.9 // rank_by=hybrid 的分段线
   }
 }
 ```

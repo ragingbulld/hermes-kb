@@ -6,6 +6,13 @@
      让主AI自己判断是「追加修正节」还是「force 重写」。查重不靠模型自觉 —— 写在
      handler 里，可外部复核。
   3. 双根落盘 + md5 一致校验（KB 规约：reflections/ 卡片双根）。
+     **部分部署里双根是同一实体**：inbox 根是 local 根的符号链接（路径由
+     `REFLECTIONS_INBOX_DIR` / `LOCAL_KB_REFLECTIONS_DIR` 决定，可用环境变量覆盖）。
+     此时物理上只有一份卡，双根语义保留（两个路径都能写、都能读、都走同一套越界
+     校验），但「两份副本会静默漂移」这个结构性隐患被消灭。下面的写入/改卡/删卡
+     逻辑因此必须按「同实体」去重：同一 inode 不重复写、不重复 remove，否则第二次
+     remove 会抛 ENOENT 并被记成一个假的 failed 记录（删除本身已成功，但回执看起来
+     像失败了）。
   4. 回执照内置记忆工具 tool result 形态，主AI 收到后自然转述。
 
 为什么查重的判据是「语义检索」而不是字符串相似度:
@@ -17,10 +24,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -28,7 +37,7 @@ from typing import Any
 
 logger = logging.getLogger("hermes_kb_write")
 
-# ── KB 规约路径（与 hermes-kb-reflection 保持一致，双根镜像） ──────────────────
+# ── KB 规约路径（双根镜像） ────────────────────────────────────────────────────
 # 双根落盘目录。两个根都写同一份卡（md5 一致），索引只建一份。
 # 用环境变量覆盖，不写死：KB_REFLECTIONS_INBOX_DIR / KB_REFLECTIONS_LOCAL_DIR
 REFLECTIONS_INBOX_DIR = os.environ.get(
@@ -54,7 +63,6 @@ DRY_RUN = (os.environ.get("KB_WRITE_DUP_DRY_RUN") or "").strip().lower() in ("1"
 JUDGE_MODE = (os.environ.get("KB_WRITE_DUP_JUDGE") or "1").strip().lower() not in (
     "0", "false", "no", "off"
 )
-DUP_JUDGE_CANDIDATES = int(os.environ.get("KB_WRITE_DUP_JUDGE_CANDIDATES") or "3")
 DUP_SNIPPET_CHARS = int(os.environ.get("KB_WRITE_DUP_SNIPPET_CHARS") or "400")
 
 # ── 工具 schema ───────────────────────────────────────────────────────────────
@@ -153,11 +161,67 @@ def _title_similar(a: str, b: str) -> bool:
     return len(short) >= 12 and short in long
 
 
+def _ensure_hermes_kb_importable() -> str:
+    """把 `hermes_kb` 挂上 sys.path，返回解析到的父目录（已可用或全失败为空串）。
+
+    ⚠ 与 `hermes-kb-auto-inject/plugin_common.py::ensure_hermes_kb_importable` 是同一套
+    逻辑的两份拷贝 —— 故意不去抽公共层：两个插件各自可被独立启用/禁用，谁也不能假定
+    对方先加载。改这里请同步改那边（唯一真源写在 auto-inject 那份的注释里）。
+
+    为什么需要它：`hermes_kb` 住在 $HERMES_HOME 下，不在 site-packages 里；网关用
+    `python3 -I -c` 启动，`-I` 忽略 PYTHONPATH / user-site，原本只能靠 venv 里一个
+    手工 `.pth` 进 path。而 `.pth` 不属于任何 pip 包，pm 每次换 generation 都不带上
+    它 —— 2026-11-06 就是这样整条链路静默哑掉（查重被 fail-open 放行、注入返回空）。
+    自己解析自己的依赖，才不依赖那份没人维护的外部文件。
+    """
+    try:
+        if importlib.util.find_spec("hermes_kb") is not None:
+            return ""
+    except (ImportError, ValueError):
+        pass
+
+    cands: "list[str]" = []
+
+    def _add(p) -> None:
+        if not p:
+            return
+        v = os.path.abspath(os.path.expanduser(str(p)))
+        if v and v not in cands:
+            cands.append(v)
+
+    _add(os.environ.get("HERMES_KB_HOME"))
+    try:
+        from hermes_constants import get_hermes_home  # noqa: PLC0415
+
+        _add(get_hermes_home())
+    except Exception:  # noqa: BLE001 - core 换 API 也不能让查重挂掉
+        pass
+    _add(os.environ.get("HERMES_HOME"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    _add(os.path.dirname(os.path.dirname(here)))
+    _add(os.path.join(os.path.expanduser("~"), ".hermes"))
+
+    for root in cands:
+        if not os.path.isfile(os.path.join(root, "hermes_kb", "__init__.py")):
+            continue
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        try:
+            if importlib.util.find_spec("hermes_kb") is not None:
+                logger.info("[KBWrite] hermes_kb 自举成功：%s 已挂上 sys.path", root)
+                return root
+        except (ImportError, ValueError):
+            pass
+        sys.path.remove(root)
+    return ""
+
+
 def _get_engine():
     global _engine
     if _engine is not None:
         return _engine
     try:
+        _ensure_hermes_kb_importable()
         from hermes_kb.engine import KBEngine
         _engine = KBEngine()
         logger.info("[KBWrite] KBEngine ready for dedup gate")
@@ -264,9 +328,10 @@ def _dedup_check(title: str, body: str) -> tuple[bool, list[dict], str]:
         # 原先这里显式覆写成 rank_by="reranker"，与主检索路径（config.retrieval.rank_by
         # 已是 "rrf"）不一致：同主题候选池上 reranker 分饱和（实测 25 张里 12 张 >=0.99，
         # 分差落到 1e-5 噪声级），拿它排等于随机；RRF 序命中第 1 名 6/6、平均位次 1.00。
-        # 故不再覆写排序键 —— 顺序按 rrf_score，DUP_THRESHOLD 仍卡 rerank_score。
+        # 2026-11-01 起改为 hybrid 分段取键（与主检索路径同口径）：饱和区按
+        # rrf_score 排、有梯度区按 rerank_score 排；DUP_THRESHOLD 仍卡 rerank_score。
         results = eng.search(
-            query, rerank_top_n=DUP_RERANK_TOP_N, use_reranker=True, rank_by="rrf"
+            query, rerank_top_n=DUP_RERANK_TOP_N, use_reranker=True, rank_by="hybrid"
         )
     except Exception as e:
         logger.warning("[KBWrite] dedup search failed: %s", e)
@@ -351,25 +416,46 @@ def _dedup_check(title: str, body: str) -> tuple[bool, list[dict], str]:
     return bool(hits), hits, note
 
 
+def _distinct_roots(filename: str) -> list[str]:
+    """返回该 filename 在双根下**物理上互不相同**的路径列表。
+
+    部分部署里 inbox 根是 local 根的符号链接（具体路径见
+    `REFLECTIONS_INBOX_DIR` / `LOCAL_KB_REFLECTIONS_DIR`），两个路径指向同一个 inode。
+    此时只应写/删一次：对同一 inode 做第二次
+    `os.remove()` 会抛 ENOENT，在回执里表现为「删除失败」，而实际上删除已经成功。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in (REFLECTIONS_INBOX_DIR, LOCAL_KB_REFLECTIONS_DIR):
+        p = os.path.join(d, filename)
+        # realpath 解析符号链接；目录本身可能尚未创建，退回 normpath 比较
+        key = os.path.realpath(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def _write_dual_root(filename: str, content: str) -> tuple[bool, str, str]:
-    """写双根并校验 md5 一致。返回 (ok, inbox_path, md5)。"""
+    """写双根并校验 md5 一致。返回 (ok, inbox_path, md5)。
+
+    双根为同一实体（符号链接）时只写一份，md5 校验退化为单份校验 —— 语义不变。
+    """
     os.makedirs(REFLECTIONS_INBOX_DIR, exist_ok=True)
     os.makedirs(LOCAL_KB_REFLECTIONS_DIR, exist_ok=True)
-    p1 = os.path.join(REFLECTIONS_INBOX_DIR, filename)
-    p2 = os.path.join(LOCAL_KB_REFLECTIONS_DIR, filename)
+    targets = _distinct_roots(filename)
     data = content.encode("utf-8")
-    for p in (p1, p2):
+    for p in targets:
         tmp = p + ".part"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, p)
 
     md5 = hashlib.md5(data).hexdigest()
-    m1 = hashlib.md5(open(p1, "rb").read()).hexdigest()
-    m2 = hashlib.md5(open(p2, "rb").read()).hexdigest()
-    if not (m1 == m2 == md5):
-        return False, p1, md5
-    return True, p1, md5
+    if not all(hashlib.md5(open(p, "rb").read()).hexdigest() == md5 for p in targets):
+        return False, os.path.join(REFLECTIONS_INBOX_DIR, filename), md5
+    return True, os.path.join(REFLECTIONS_INBOX_DIR, filename), md5
 
 
 
@@ -592,9 +678,10 @@ def _resolve_card_paths_lenient(card_path: Any) -> list[str]:
         allowed = (os.path.abspath(REFLECTIONS_INBOX_DIR), os.path.abspath(LOCAL_KB_REFLECTIONS_DIR))
         if d not in allowed:
             return []
-    return [p for p in (os.path.join(REFLECTIONS_INBOX_DIR, base),
-                        os.path.join(LOCAL_KB_REFLECTIONS_DIR, base))
-            if os.path.isfile(p)]
+    return _distinct_roots(base) if any(
+        os.path.isfile(os.path.join(d, base))
+        for d in (REFLECTIONS_INBOX_DIR, LOCAL_KB_REFLECTIONS_DIR)
+    ) else []
 
 
 def _count_chunks_for(path: str) -> int:
@@ -617,20 +704,52 @@ def _count_chunks_for(path: str) -> int:
         return -1
 
 
+def _index_path_variants(p: str) -> list[str]:
+    """同一张卡在索引里可能出现的所有 file_path 写法。
+
+    `delete_by_file_path()` 是**字面精确匹配**（`WHERE file_path = ?`），而索引键来自
+    watcher 扫描时的路径字面。双根为同一实体后，卡可能以两根各自的写法入索引
+    （同一个文件、两个不同前缀）；只删其中一种会静默留下另一半脏切片。
+    """
+    base = os.path.basename(p)
+    out: list[str] = []
+    for d in (REFLECTIONS_INBOX_DIR, LOCAL_KB_REFLECTIONS_DIR):
+        cand = os.path.join(d, base)
+        if cand not in out:
+            out.append(cand)
+    # 真实路径（解析符号链接后）也要覆盖
+    real = os.path.realpath(p)
+    if real not in out:
+        out.append(real)
+    return out
+
+
 def _purge_index_for(paths: list[str]) -> dict:
-    """显式清索引切片（不等 watcher），并回读剩余切片数。"""
+    """显式清索引切片（不等 watcher），并回读剩余切片数。
+
+    对每个待删文件，按**全部路径变体**清一遍，避免因双根写法不同而漏清。
+    """
     out: dict = {}
     eng = _get_engine()
     for p in paths:
         if not eng:
             out[p] = {"purged": False, "residual_chunks": -1, "error": "lancedb 引擎不可用"}
             continue
-        try:
-            purged = bool(eng.delete_by_file_path(p))
-        except Exception as e:
-            out[p] = {"purged": False, "residual_chunks": -1, "error": str(e)}
-            continue
-        out[p] = {"purged": purged, "residual_chunks": _count_chunks_for(p)}
+        variants = _index_path_variants(p)
+        purged_all, errs = True, []
+        for v in variants:
+            try:
+                purged_all = bool(eng.delete_by_file_path(v)) and purged_all
+            except Exception as e:
+                errs.append(f"{v}: {e}")
+        residual = max(_count_chunks_for(v) for v in variants)
+        out[p] = {
+            "purged": purged_all,
+            "residual_chunks": residual,
+            "variants": variants,
+        }
+        if errs:
+            out[p]["error"] = "; ".join(errs)
     return out
 
 
@@ -662,7 +781,7 @@ def _find_candidates(query: str, top_k: int) -> dict:
             limit=FIND_CANDIDATE_LIMIT,
             rerank_top_n=FIND_RERANK_TOPN,
             use_reranker=True,
-            rank_by="reranker",
+            rank_by="hybrid",
         )
     except Exception as e:
         return {"success": False, "error": f"检索异常：{e}"}
@@ -824,16 +943,18 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
             where = "after_anchor"
 
         data = new_txt.encode("utf-8")
-        for p in (p1, p2):
+        targets = _distinct_roots(os.path.basename(p1))
+        for p in targets:
             tmp = p + ".part"
             with open(tmp, "wb") as f:
                 f.write(data)
             os.replace(tmp, p)
 
-        m3, m4 = _md5_file(p1), _md5_file(p2)
-        if not (m3 == m4 == hashlib.md5(data).hexdigest()):
+        want = hashlib.md5(data).hexdigest()
+        if not all(_md5_file(p) == want for p in targets):
             return json.dumps({"success": False, "error": "双根写入后 md5 不一致"},
                               ensure_ascii=False)
+        m3 = _md5_file(p1)
 
         card_title = ""
         for line in new_txt.splitlines():
@@ -896,14 +1017,16 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
 
     new_txt = txt.replace(old, new, 1)
     data = new_txt.encode("utf-8")
-    for p in (p1, p2):
+    targets = _distinct_roots(os.path.basename(p1))
+    for p in targets:
         tmp = p + ".part"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, p)
-    m3, m4 = _md5_file(p1), _md5_file(p2)
-    if not (m3 == m4 == hashlib.md5(data).hexdigest()):
+    want = hashlib.md5(data).hexdigest()
+    if not all(_md5_file(p) == want for p in targets):
         return json.dumps({"success": False, "error": "双根写入后 md5 不一致"}, ensure_ascii=False)
+    m3 = _md5_file(p1)
 
     base = os.path.basename(p1)
     title = _card_title_from_file(p1)
@@ -1049,7 +1172,7 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
         if JUDGE_MODE:
             best = hits[0]
             cands = []
-            for h in hits[:DUP_JUDGE_CANDIDATES]:
+            for h in hits:
                 real = _resolve_existing_card_path(h.get("path") or "") or (h.get("path") or "")
                 h1s = _h1_titles_in_file(real) if real else []
                 cands.append({
@@ -1107,7 +1230,7 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
             logger.info("[KBWrite] DRY-RUN: would have rejected duplicate %r; hits=%s", title, hits)
         else:
             logger.info("[KBWrite] duplicate rejected: %r hit %s", title,
-                        [h.get("path") or h.get("existing_card") for h in hits[:3]])
+                        [h.get("path") or h.get("existing_card") for h in hits])
             best = hits[0]
             existing = best.get("path") or best.get("existing_card") or ""
             return json.dumps({
@@ -1372,7 +1495,9 @@ RECEIPT_TITLE_MAX = int(os.environ.get("KB_WRITE_RECEIPT_TITLE_MAX") or "48")
 _PENDING_RECEIPTS: list = []
 _PENDING_RECEIPTS_LOCK = threading.Lock()
 RECEIPT_QUEUE_TTL = float(os.environ.get("KB_WRITE_RECEIPT_TTL") or "1800")
-STATE_DB_PATH = os.environ.get("KB_WRITE_STATE_DB") or os.path.expanduser("~/.hermes/state.db")
+STATE_DB_PATH = os.environ.get("KB_WRITE_STATE_DB") or os.path.expanduser(
+    "~/.hermes/state.db"
+)
 _RECEIPT_CHAT_KEY_CACHE: dict = {}
 
 # SOP 回执前缀。刻意不复用原生 i18n 模板 display.review.summary_callback
@@ -1831,10 +1956,30 @@ def register(ctx: Any) -> None:
     )
     logger.info(
         "[KBWrite] registered save_reflection (dedup_threshold=%s, rerank_top_n=%s, dry_run=%s, "
-        "judge_mode=%s, judge_candidates=%s, snippet_chars=%s)",
-        DUP_THRESHOLD, DUP_RERANK_TOP_N, DRY_RUN, JUDGE_MODE, DUP_JUDGE_CANDIDATES, DUP_SNIPPET_CHARS,
+        "judge_mode=%s, snippet_chars=%s)",
+        DUP_THRESHOLD, DUP_RERANK_TOP_N, DRY_RUN, JUDGE_MODE, DUP_SNIPPET_CHARS,
     )
     logger.info("[KBWrite] registered edit_reflection_card (4-in-1: find/insert/replace/delete; "
                 "whitelisted for SOP fork but replace/delete hard-blocked in-handler)")
     logger.info("[KBWrite] registered delete_reflection_card "
                 "(main-AI only; deliberately NOT whitelisted for SOP fork)")
+    # 装载留痕：`plugin_health_watchdog.py` 的「改动是否已装载」判据 grep 的就是
+    # `code md5=` + 插件名 + 时间戳这一行（热重载不改变进程启动时间，只能靠它翻案）。
+    # 本插件早先没有这行，于是每次改完必定被判「改动未装载，需 reload」——
+    # 与 auto-inject 那份保持同一字面形态，别改格式。
+    try:
+        import hashlib as _hl
+        import pathlib as _pl
+        _pkg = _pl.Path(__file__).parent
+        _blob = b"".join(
+            p.read_bytes() for p in sorted(_pkg.glob("*.py")) if not p.name.endswith(".bak")
+        )
+        _md5 = _hl.md5(_blob).hexdigest()[:12]
+        _lines = sum(len(p.read_text(encoding="utf-8").splitlines())
+                     for p in sorted(_pkg.glob("*.py")))
+        logger.info(
+            "hermes-kb-write code md5=%s (%s 行) registered — save_reflection 查重闸门 + "
+            "edit/delete 卡出口 + hermes_kb 自举", _md5, _lines,
+        )
+    except Exception:  # noqa: BLE001 - 留痕失败绝不影响注册
+        logger.info("hermes-kb-write registered — save_reflection 查重闸门 + edit/delete 卡出口")

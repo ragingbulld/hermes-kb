@@ -18,16 +18,13 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from .plugin_common import (
-    MENU_BUDGET,
-    MENU_MAX_CARDS,
     PROTOCOL_PROMPT,
-    _HDR_RE,
-    _USER_QUERY_MAX_CARDS,
     _content_text,
     _kb_query_is_usable,
     _short,
     _user_query_text,
     logger,
+    scan_heads,
 )
 
 
@@ -42,11 +39,12 @@ class KBAutoInjectPlugin:
         # 协议段「每 turn 只发一次」的记账 —— 本插件唯一保留的 turn 状态。
         self._turns: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._max_turn_states = 128
-        # ---------------- 全部状态：本轮印过的卡 + 去重键 ----------------
-        # 本轮清单里**已经印过**的卡（card_key）。不存正文：正文一律由 read_file 取，
-        # 插件不再持有任何一块原文 —— 存了也只服务一个已删掉的展开工具。
-        # 只增不改：序号 = 下标 + 1，所以已发出去的 #N 永不重排。
-        self._shown: List[Tuple[str, str]] = []
+        # ---------------- 全部状态：本轮印过的卡 + 已印落点 ----------------
+        # card_key -> {"no": 序号, "hits": 已印过的落点集合}。不存正文：正文一律由
+        # read_file 取，插件不再持有任何一块原文 —— 存了也只服务一个已删掉的展开工具。
+        # 键一旦入册序号就定死（同一张卡永远同一个 #N），已发出去的号永不重排。
+        # 落点按 (完整标题链, 起行, 行数) 记账 —— 去重的尺度是落点，不是整张卡。
+        self._shown: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # 同一轮里同一个检索词只检索一次：模型一批里两个调用写同一个 kb_query，
         # 就会检索两遍、贴两份清单（实测 20261023_225015_ea5c533c）。
         self._served_query = ""
@@ -149,6 +147,10 @@ class KBAutoInjectPlugin:
     # 整卡行数 / 命中块行号：read_file 的 offset/limit 是按行的，这两个缓存让
     # 一屏清单只读一次文件（同一个 file_path 的多块共用）。
     _disk_cache: Dict[str, Tuple[str, int]] = {}
+    # 文件的标题骨架（标题行 + 每节起止行），按文件缓存。所有行号推导都查它。
+    _outline_cache: Dict[str, Dict[str, Any]] = {}
+    # (文件, 链) → 行范围。画树时同一节点会被问很多次，不缓存就是重复全扫。
+    _span_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[Tuple[int, int, int], ...]] = {}
 
     def _card_size(self, file_path: str) -> Tuple[int, int]:
         """这张卡在库里一共多少字、切成几块。
@@ -204,6 +206,48 @@ class KBAutoInjectPlugin:
         """整卡共几行（`read_file` 的 limit 按行算，字数换算不出行号）。"""
         return self._disk(file_path)[1] if file_path else 0
 
+    def _outline(self, file_path: str) -> Dict[str, Any]:
+        """文件的**标题骨架**，一处算好，三处共用。``{"lines": n, "heads": [...], "end": {}}``
+
+        - ``heads``：围栏外的标题行 ``[(行下标, 级别, 已清洗文本)]``，按行序。
+        - ``end``：每个标题的**节结束行下标**（不含）—— 下一个「级别不高于它」的标题，
+          没有就是文件尾。一次算好，`_locate` / `_chain_spans` 都查它，不再各自往下扫。
+
+        为什么要收敛成一个：这三件事（找块所在的节、算链上每级的范围、找卡的 H1）
+        本来都要「扫标题行 + 找下一个同级或更高级的标题」，早先是三份各写一遍的实现，
+        于是围栏感知这种修复要改三处、必然漏一处。现在只有一份。
+
+        围栏感知是硬要求，不是优化：文档里的 shell / python 示例常写成
+
+            ```bash
+            # Batch #1 FAILED: embedding failed for 2/2 texts
+            ```
+
+        那行 `# xxx` 是注释，早先被 `_HDR_RE` 当 H1 认了，后果不是少标一格 —— 而是
+        **把上一节的结束行算错**（父节本该到文件尾，被这条假 H1 截断），于是它下面
+        所有子节的 `行 a~b` 全落在父范围之外，模型照抄行号读到不相干内容。
+        实测 `framework-packaging-and-fresh-install.md` 第 70 行就是这么把整棵树带偏的。
+        """
+        cached = self._outline_cache.get(file_path)
+        if cached is not None:
+            return cached
+        disk = self._disk(file_path)[0]
+        lines = disk.split("\n") if disk else []
+        heads = scan_heads(lines)
+        # 每个标题的节结束行：往下第一个级别不高于它的标题；没有就是文件尾。
+        end: Dict[int, int] = {}
+        for k, (i, lvl, _t) in enumerate(heads):
+            stop = len(lines)
+            for j, lvl2, _t2 in heads[k + 1:]:
+                if lvl2 <= lvl:
+                    stop = j
+                    break
+            end[i] = stop
+        out = {"lines": len(lines), "heads": heads, "end": end,
+               "level": {i: lvl for i, lvl, _t in heads}}
+        self._outline_cache[file_path] = out
+        return out
+
     def _locate(
         self, file_path: str, content: str
     ) -> Optional[Tuple[int, int, int, int]]:
@@ -214,9 +258,8 @@ class KBAutoInjectPlugin:
         两种都不中就直接返回 None —— 宁可少给，也不给会让模型读错地方的假行号。
 
         **节起行**：块是从节中间切下去的（一个 1,500 字的块常常只是某节的第 1 片），
-        所以从块头往上找最近的 `#…` 标题行，再往下找到第一个「级别不高于它」的标题，
-        中间就是这个标题管辖的整节。全库 29% 的块 heading_path 有 3 层以上，
-        「命中段 18 行」和「该节 96 行」是两个不同的东西，都告诉模型它才有得选。
+        所以从块头往上找最近的标题行，它的节范围就是骨架里算好的那段。全库 29% 的块
+        heading_path 有 3 层以上，「命中段 18 行」和「该节 96 行」是两个不同的东西。
         """
         if not file_path or not content:
             return None
@@ -235,21 +278,14 @@ class KBAutoInjectPlugin:
                 break
         if not start:
             return None
-        lines = disk.split("\n")
+        out = self._outline(file_path)
         sec_start, sec_lines = start, seg_lines
-        for i in range(min(start - 1, len(lines) - 1), -1, -1):
-            m = _HDR_RE.match(lines[i])
-            if not m:
-                continue
-            lvl = len(m.group(1))
-            end = len(lines)
-            for j in range(i + 1, len(lines)):
-                m2 = _HDR_RE.match(lines[j])
-                if m2 and len(m2.group(1)) <= lvl:
-                    end = j
-                    break
-            sec_start, sec_lines = i + 1, end - i
-            break
+        # 块头之上（含块头那行）最后一个标题，就是块所在的节。
+        for i, _lvl, _t in reversed(out["heads"]):
+            if i + 1 <= start:
+                sec_start = i + 1
+                sec_lines = out["end"][i] - i
+                break
         # 块会跨节：chunker 是按字数切的，不看标题，实测有 31 行的块落在 7 行的
         # 「## 避坑铁律」下面，直接印「该节 591~597」会让模型**读少一半内容**。
         # 这种情况只给命中段 —— 宁可少给一个语义单元，不给一个会截断的假坐标。
@@ -260,21 +296,29 @@ class KBAutoInjectPlugin:
     def _build_menu(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """过闸门的块 → 一屏标题菜单，每行自带 `read_file` 直接可用的行号。
 
-        跳过条件只有一个：**这张卡本轮清单里已经印过了**（判据是卡，所以同一张卡的
-        另一块也一起挡掉）。正文要不要读、读哪几行，由模型拿行号自己定。
+        **一卡一行，落点一处不少**：同一张卡命中多块时全收进 `hits`（每块带自己的
+        **完整标题链** + 命中段行范围），渲染层把重复的链前缀合并成一棵树 ——
+        同一小节下命中四片，就只印一次小节名、下面挂四个命中段。
+
+        早先这里直接 `continue` 掉后续块，实测一张卡能命中 12 块，11 处落点凭空消失。
         """
         menu: List[Dict[str, Any]] = []
-        seen = set()
+        seen: Dict[Tuple[str, str], int] = {}
         for chunk in chunks:
             key = self._card_key(chunk)
-            if key in seen:
-                continue
-            seen.add(key)
             fp = str(chunk.get("file_path") or "")
+            hit = self._chunk_hit(chunk)
+            if key in seen:
+                # 同一张卡的另一块：落点挂到已印的那一行上，不丢。
+                if hit:
+                    _hits = menu[seen[key]]["hits"]
+                    if hit not in _hits:
+                        _hits.append(hit)
+                continue
+            seen[key] = len(menu)
             content = str(chunk.get("content") or "")
             total, blocks = self._card_size(fp)
             geo = self._locate(fp, content)
-            _chain = self._card_chain(chunk)
             # 卡标题行印的「行 a~b」必须是**这张卡自己**的范围，不是整个文件。
             # 一个 .md 里可以塞好几张卡（实测 441 份文件装 1,048 张），第二张卡从
             # 自己的 H1 那一行才算开始；照文件总行数印「行 1~N」，模型抄下去就会
@@ -294,9 +338,9 @@ class KBAutoInjectPlugin:
                 "key": key,
                 "cid": str(chunk.get("chunk_id") or ""),
                 "title": self._card_title(chunk),
-                "chain": _chain,
-                # 每段自己的字符数，与 "total" 同一口径（都是 len 字符数）
-                "chain_spans": self._chain_spans(fp, _chain),
+                # 这张卡的全部命中落点（含首块）：[{chain, a, n}, ...]。
+                # chain 是完整标题链（不含 H1），渲染层按它合并成树。
+                "hits": [hit] if hit else [],
                 # 体量：整卡字数 / 块数 / 整卡行数 —— 决定「一次读完」还是「只读命中段」
                 "total": total,
                 "blocks": blocks,
@@ -304,16 +348,29 @@ class KBAutoInjectPlugin:
                 # card_start 是它在文件里的起始行，渲染层拼成「行 a~b」。
                 "total_lines": _cl,
                 "card_start": _cs,
-                # 命中段在原文里的 (起行, 行数)。定位不到就是 None，那行不印。
-                "line_start": geo[0] if geo else 0,
-                "seg_lines": geo[1] if geo else 0,
-                # 命中块所属的整节（可能比块大得多：块 1,500 字上限，节想多长就多长）
-                "sec_start": geo[2] if geo else 0,
-                "sec_lines": geo[3] if geo else 0,
                 # 绝对路径：read_file 的唯一入口
                 "path": fp,
             })
         return menu
+
+    def _chunk_hit(self, chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """一个命中块的落点：``{chain, a, n}`` —— 完整标题链 + 命中段行范围。
+
+        **必须带完整链**（不含 H1）：渲染层就是靠比对各块链的公共前缀来合并成树的。
+        早先只留末级小节名，于是「一、三屏 > 多级标题」和「九、上线后 > 多级标题」
+        这两处不同分支的同名小节糊成一行，看着像重复。
+
+        定位不到行号就返回 None —— 不印没有坐标的条目，那种行模型抄不了。
+        """
+        geo = self._locate(str(chunk.get("file_path") or ""),
+                           str(chunk.get("content") or ""))
+        if not geo or not geo[0] or not geo[1]:
+            return None
+        return {
+            "chain": self._card_chain(chunk),
+            "a": geo[0],
+            "n": geo[1],
+        }
 
     @classmethod
     def _card_chain(cls, chunk: Dict[str, Any]) -> List[str]:
@@ -355,6 +412,10 @@ class KBAutoInjectPlugin:
         seg = re.sub(r"\{#[-\w]+\}", "", seg)
         return seg.replace("**", "").replace("`", "").strip()
 
+    def _heads(self, file_path: str) -> List[Tuple[int, int, str]]:
+        """磁盘上的标题行 ``[(行下标, 级别, 已清洗文本)]`` —— 直接取骨架，不自己扫。"""
+        return self._outline(file_path)["heads"]
+
     def _chain_spans(self, file_path: str, chain: List[str]) -> List[Tuple[int, int, int]]:
         """命中链每一级在原文里的 ``(字符数, 起行, 行数)``。
 
@@ -368,146 +429,198 @@ class KBAutoInjectPlugin:
         「这一级就够了」还是「得往下钻两层」。只给整卡总数是失效口径：整卡 48k 字、
         命中那节 96 字，两个数差 500 倍，不给节大小等于让模型猜。
 
-        算法：扫磁盘原文的标题行建树，按链的顺序**逐级收窄搜索范围**（第 i 段只在第
-        i-1 段的子树里找），所以同名小节不会串到别的分支去。任一级比对上就跳过那一段
-        （返回 0，渲染层就不标），绝不给猜出来的数。
+        算法：在骨架里按链的顺序**逐级收窄搜索范围**（第 i 段只在第 i-1 段的子树里找），
+        所以同名小节不会串到别的分支去。任一级对不上就跳过那一段（返回 0，渲染层
+        不标），绝不给猜出来的数。
         """
         if not file_path or not chain:
             return []
-        disk = self._disk(file_path)[0]
-        if not disk:
-            return []
-        lines = disk.split("\n")
-        heads = []
-        for i, ln in enumerate(lines):
-            m = _HDR_RE.match(ln)
-            if m:
-                heads.append((i, len(m.group(1)), self._clean_heading(m.group(2))))
+        # 记忆化：画树时每个节点都要算一次行范围，同一 (文件, 链) 会反复问。
+        # 实测一张 5000 行卡画完要 1.8 秒 —— 注入钩子跑在每轮请求路径上，不能留。
+        _ck = (file_path, tuple(chain))
+        _cached = self._span_cache.get(_ck)
+        if _cached is not None:
+            return list(_cached)
+        out = self._outline(file_path)
+        lines = self._disk(file_path)[0].split("\n") if out["lines"] else []
+        heads = out["heads"]
         spans: List[Tuple[int, int, int]] = []
         lo, hi = 0, len(lines)
+
+        def _find(want_: str, lo_: int, hi_: int) -> int:
+            """在 ``[lo_, hi_)`` 行内找这个标题，**返回最贴近的那个**。
+
+            匹配口径（从紧到松）：
+            1. 完全相等 —— 优先；
+            2. 互相 `startswith` —— 只用于吸收 markdown 残留（反引号、`**`、锚点已被
+               `_clean_heading` 剥掉后仍有的尾差），但**必须**取最长公共的那个，不能
+               见着第一个就返回。
+
+            早先只有第 2 条且「见第一个就返回」：同一张卡里「改法」和「改法：一卡一行」
+            是两个不同小节，找「改法：一卡一行」时先撞上兄弟节点「改法」就返回了，
+            于是行范围指到别的小节（实测把 6734~6777 标成 5277~5293）。
+            """
+            exact, loose = -1, -1
+            for idx, (i, _lvl, txt) in enumerate(heads):
+                if i < lo_ or i >= hi_:
+                    continue
+                if txt == want_:
+                    return idx
+                if loose < 0 and (txt.startswith(want_) or want_.startswith(txt)):
+                    loose = idx
+            return exact if exact >= 0 else loose
+
         for want in chain:
             want = self._clean_heading(want)
-
-            def _find(lo_: int, hi_: int) -> int:
-                for idx, (i, _lvl, txt) in enumerate(heads):
-                    if i < lo_ or i >= hi_:
-                        continue
-                    if txt == want or txt.startswith(want) or want.startswith(txt):
-                        return idx
-                return -1
-
-            hit = _find(lo, hi)
+            hit = _find(want, lo, hi)
             if hit < 0:
-                # 子树内找不到就退回全文再找一次。收窄是为了消解同名歧义（同一张卡里三个
-                # 「修法与验收」），但 heading_path 是入库时拍的快照：磁盘被改过、或上一级
-                # 匹配到了别处的同名标题，子树就会整个落空。实测这类漏标占 2.6%，全在
-                # 「父级匹配偏移」这一种成因上 —— 退一步能救回来，且不会把同名节串错，
-                # 因为同名歧义早在父级收窄那一步就消掉了。
-                hit = _find(0, len(lines))
-            if hit < 0:
+                # **不回退全文**。早先这里 `_find(0, len(lines))` 兜底，理由是
+                # 「heading_path 是入库快照，父级偏移会让子树整个落空」（实测 2.6%）。
+                # 但回退的代价是**给出别的分支的行号** —— 画成树之后，一个孙子节点
+                # 的行范围能落到它祖先范围之外（实测 6734~6777 挂在 6706~6722 下面），
+                # 模型照着抄就是读到不相干的内容。
+                # 宁可这一段标 (0,0,0) 不印行号，也不给一个会让人读错的坐标。
                 spans.append((0, 0, 0))
+                lo, hi = 0, len(lines)
                 continue
-            i, lvl, _txt = heads[hit]
-            end = len(lines)
-            for j in range(i + 1, len(lines)):
-                m2 = _HDR_RE.match(lines[j])
-                if m2 and len(m2.group(1)) <= lvl:
-                    end = j
-                    break
+            i, _lvl, _txt = heads[hit]
+            end = out["end"][i]        # 骨架里已算好：下一个同级或更高级的标题
             spans.append((sum(len(x) + 1 for x in lines[i:end]), i + 1, end - i))
             lo, hi = i + 1, end
+        self._span_cache[_ck] = tuple(spans)
         return spans
 
-    @staticmethod
-    def _render_menu(
-        menu: List[Dict[str, Any]], start: int = 1, more: int = 0
-    ) -> str:
+    def _render_menu(self, menu: List[Dict[str, Any]]) -> str:
         """标题清单：序号 + 卡标题 + 命中小节 + **可直接喂给 `read_file` 的行号**。
 
         刻意不印 gate 分（全挤在 0.99xx，纯噪音）、不印 chunk_id（4 位前缀 36.42% 碰撞）。
 
         每行给的是 `read_file` 的现成参数，不是给人看的描述：
         每级都带自己的 `行 a~b`，读整级还是只读命中段，由调用方按任务定。
+
+        改成实例方法（原 `@staticmethod`）：画树时要查磁盘标题行算每节的行范围，
+        那需要 `_chain_spans` / `_outline`。原先只有 `_chain_spans` 被外部算好
+        传进来，所以还能是静态的；现在树的形状由命中集合决定，行范围得在里面现算。
+
+        序号不在这里发：`#N` 是**跨屏地址**，由 `_inline_menu` 记账时定死
+        （同一张卡永远同一个号），渲染层只负责照 `m["no"]` 印。
         """
+        _chain_spans = self._chain_spans
 
-        def _chain_lines(chain: List[str], spans: List[Tuple[int, int, int]], tail: str = "") -> str:
-            """标题链画成树：一行一层，逐级缩进，每层尾巴标该节字数。
+        def _hit_tree(m: Dict[str, Any], tail: bool = True) -> str:
+            """把这张卡的全部命中落点合并成**一棵**树。
 
-            挤成 `A > B > C` 一行时，模型要自己在长句里数层级边界；实测卡越长越数不清
-            （「6. Repoint a public Minecraft address only af…」这种直接看不出它在第几层）。
-            一行一层就不用数了，代价是每层多一个换行。
+            为什么要合并：同一小节常被切出好几片（一张卡 12 块里 4 块同属
+            「多级标题」那一节）。早先每块一行，于是同一个小节名连印四遍、各带一个
+            行范围，看着像四条互不相干的命中，实际是同一节的四个片段 —— 既浪费
+            预算，也让模型以为要分四次去读。
 
-            每层的 `· N 字` 和整卡行用的是同一把尺子（都是 len 字符数）—— 模型拿两个数
-            比一下就知道该读到哪一层，不用先点进去再后悔。
+            合并规则：按各块**完整标题链**的公共前缀建树，同一个节点只印一次；
+            命中段作为叶子挂在它自己那一节下面。跨分支的同名小节（「一、三屏 >
+            多级标题」与「九、上线后 > 多级标题」）链前缀不同，各在各的分支里，
+            不会被糊成一行。
+
+            每一级仍带自己的 `· N 字 · 行 a~b（n 行）` —— 那个范围是**整节**的，
+            和叶子上的「命中段」是两个不同粒度，都要给。
+
+            ``tail=False`` 省掉末尾的 `路径` 行：老卡的追加块，路径在上一条消息里
+            已经给过，再抄一遍纯属重复。
             """
-            if not chain:
+            hits = [h for h in (m.get("hits") or [])
+                    if int(h.get("a") or 0) and int(h.get("n") or 0)]
+            if not hits:
                 return ""
+            fp = str(m.get("path") or "")
+            # 建树：children 保持首次出现的顺序（检索序），leaves 按行号排序（文档序）。
+            root: Dict[str, Any] = {"seg": "", "children": {}, "order": [], "leaves": []}
+            for h in hits:
+                node = root
+                for seg in (h.get("chain") or []):
+                    if seg not in node["children"]:
+                        node["children"][seg] = {
+                            "seg": seg, "children": {}, "order": [], "leaves": []}
+                        node["order"].append(seg)
+                    node = node["children"][seg]
+                key = (int(h["a"]), int(h["n"]))
+                if key not in node["leaves"]:
+                    node["leaves"].append(key)
 
-            def _tag(i: int) -> str:
-                """`· N 字 · 行 a~b（n 行）` —— 和卡标题行同一个写法、同一把尺子。
+            def _span(segs: List[str]) -> Tuple[int, int, int]:
+                """这一级在原文里的 ``(字数, 起行, 行数)``；比对上就是 (0, 0, 0)。"""
+                if not segs:
+                    return (0, 0, 0)
+                sp = _chain_spans(fp, segs)
+                return sp[-1] if sp else (0, 0, 0)
 
-                字数回答「值不值得读」，行范围回答「怎么读」；两个都得给。只给字数，
-                想读整级的人没有 offset/limit；只给行号，判断不了这级有多大。
+            def _mark(prefix: str, last: bool) -> str:
+                """`prefix` 是祖先层的垂线串，`last` 决定本层用 `└` 还是 `├`。"""
+                return prefix + ("└ " if last else "├ ")
+
+            out: List[str] = []
+
+            def walk(node: Dict[str, Any], prefix: str, segs: List[str],
+                     tail: str = "") -> None:
+                """深度优先画这一层。孩子与叶子**按原文行号排序**（文档顺序）。
+
+                早先孩子按「首次出现」排（= 检索序），于是同一张卡的树长成
+                「六、十、一、四、七、二、九」这种乱序 —— 读者没法判断自己在文档的
+                哪个位置，也没法顺着一路读下去。树本来就该反映原文结构。
                 """
-                if i >= len(spans):
-                    return ""
-                sz, a, n = spans[i]
-                out = f" · {sz:,} 字" if sz else ""
-                if n:
-                    out += f" · 行 {a}~{a + n - 1}（{n} 行）"
-                return out
+                leaves = sorted(node["leaves"])
+                # 这一节整级就是一个命中段时（块正好切满整节）不重复印一遍叶子。
+                _nsz, na, nn = _span(segs) if segs else (0, 0, 0)
+                if len(leaves) == 1 and nn and leaves[0] == (na, nn):
+                    leaves = []
+                # (排序键, 类型, 内容)：孩子键=该节起行，叶子键=命中段起行。
+                # 定位不到行号的给孩子一个极大键，排在最后但不丢。
+                items: List[Tuple[int, str, Any]] = []
+                for s in node["order"]:
+                    _sz2, ka, _kn = _span(segs + [s])
+                    items.append((ka or 10 ** 9, "kid", node["children"][s]))
+                for l in leaves:
+                    items.append((l[0], "leaf", l))
+                if tail:
+                    # 路径行跟树的孩子同级，必须**参与** last 判定：早先它被硬编码成
+                    # `└ 路径`，于是根层既有一个 `└` 收尾的分支、又有一个 `└ 路径`，
+                    # 一棵树长出两个收口，垂线视觉上是断的。永远排最后。
+                    items.append((10 ** 10, "tail", tail))
+                items.sort(key=lambda x: x[0])
+                for idx, (_key, kind, val) in enumerate(items):
+                    last = idx == len(items) - 1
+                    # 本层垂线：最后一个孩子后面不再画 `│`，否则会拖出一条断线。
+                    child_prefix = prefix + ("  " if last else "│ ")
+                    if kind == "kid":
+                        k = val
+                        ksegs = segs + [k["seg"]]
+                        sz, a, n = _span(ksegs)
+                        tag = f" · {sz:,} 字" if sz else ""
+                        if n:
+                            tag += f" · 行 {a}~{a + n - 1}（{n} 行）"
+                        out.append(f"{_mark(prefix, last)}{k['seg']}{tag}")
+                        walk(k, child_prefix, ksegs)
+                    elif kind == "leaf":
+                        a, n = val
+                        out.append(f"{_mark(prefix, last)}"
+                                   f"命中段 行 {a}~{a + n - 1}（{n} 行）")
+                    else:
+                        out.append(f"{_mark(prefix, last)}路径：{val}")
 
-            # 不印「命中链」三个字：每张卡下面缩进的第一层就是命中处的标题路径，
-            # 没有第二种可能，标签是纯噪音。
-            #
-            # 连线必须真的连上：卡标题下面是**两个**孩子（命中链、路径），所以首段用
-            # `├`，垂线 `│` 一路贯到最末一级，路径行用 `└` 收口 ——
-            #     ├ Functionality · 21,850 字
-            #     │ └ Telemetry · 13,291 字
-            #     │   └ Configuring Sensors · 8,205 字
-            #     └ 路径：…
-            # 早先每段都写 `└ ` 且不带垂线，视觉上是一串互不相干的悬浮行，
-            # 路径那行跟上面那串断开了。
-            out = []
-            for depth, seg in enumerate(chain):
-                if depth == 0:
-                    mark = "   ├ "
-                else:
-                    mark = "   │" + " " * (2 * depth - 1) + "└ "
-                # 每行只放这一级自己的字数和范围；命中段另起一行挂在最末一级下面，
-                # 免得同一行挤两个范围（「行 241~254」和「命中段 241~250」挨着看很像笔误）。
-                out.append(f"{mark}{seg}{_tag(depth)}")
-            if tail:
-                depth = len(chain)
-                out.append("   │" + " " * (2 * depth - 1) + "└ " + tail)
-            return "\n" + "\n".join(out)
-
-        def _seg_note(m: Dict[str, Any]) -> str:
-            """最末一级额外补一笔「命中段」——只在它比整级窄时才需要。
-
-            每一级的 `行 a~b` 已经给了整级范围，所以命中段**不必**再占一个字段；
-            只有当命中落点比整级小（块只是这节的第一片）时，才值得告诉模型
-            「你其实只想看这一小段」。窄了就标，重合就闭嘴。
-            """
-            spans = m.get("chain_spans") or []
-            ls = int(m.get("line_start") or 0)
-            sl = int(m.get("seg_lines") or 0)
-            if not spans or not ls or not sl:
-                return ""
-            _sz, a, n = spans[-1]
-            if n and a == ls and n == sl:
-                return ""
-            # 块会跨节（chunker 按字数切、不看标题），此时「命中段」可能比这一级还大。
-            # 那种情况标出来是自相矛盾的（14 行的节里塞一个 36 行的段），而且会把
-            # 模型引到下一节的内容上 —— 只标完全落在这一级内部的命中段。
-            if n and not (a <= ls and ls + sl - 1 <= a + n - 1):
-                return ""
-            return f"命中段 行 {ls}~{ls + sl - 1}（{sl} 行）"
+            _tail = str(m.get("path") or "")
+            walk(root, "   ", [], _tail if tail else "")
+            return ("\n" + "\n".join(out)) if out else ""
 
         def _row(i: int, m: Dict[str, Any]) -> str:
+            # 序号由记账层（_inline_menu）给，同一张卡永远同一个号；直接拿未编号的
+            # 菜单来渲染时（离线验证脚本）就地按顺序编，不留 `#0` 这种假地址。
+            no = m.get("no") or i
+            if m.get("extra"):
+                # 老卡的新落点：卡标题那一行上一条消息里已经印过，不重印（省字），
+                # 只补这一批还没给过的命中段；路径同上，也不再抄一遍。
+                return (f"#{no} ↑ 追加 {len(m['hits'])} 处命中"
+                        + _hit_tree(m, tail=False))
             # 大标题行 = 这张卡的身份 + 整卡体量。体量决定「整篇读还是只读一段」，
             # 是卡的属性，就该跟卡标题在一起。
-            out = f"#{start + i - 1} {m['title']}"
+            out = f"#{no} {m['title']}"
             total = int(m.get("total") or 0)
             tl = int(m.get("total_lines") or 0)
             cs = int(m.get("card_start") or 1) or 1
@@ -521,37 +634,21 @@ class KBAutoInjectPlugin:
                 vol.append(f"行 {cs}~{cs + tl - 1}（{tl} 行）")
             if vol:
                 out += " · " + " · ".join(vol)
-            chain = m.get("chain") or []
-            note = _seg_note(m)
-            out += _chain_lines(chain, m.get("chain_spans") or [], note)
-            if not chain:
-                # 没有标题链（heading_path 不足两级）：直接给命中段和它所在的节。
-                # 同样「一行一个范围」：节一行、命中段再缩一层。
-                # 节**就是**这张卡本身时（一文件多卡的第二张卡必然如此：卡 = 一个 H1 节）
-                # 不重复印 —— 卡标题行已经写着同一个范围了。早先按「ss==1」判，
-                # 多卡文件里会多出一行没有名字的「行 34~74（41 行）」，看着像标题丢了。
-                ls = int(m.get("line_start") or 0)
-                sl = int(m.get("seg_lines") or 0)
-                ss = int(m.get("sec_start") or 0)
-                sn = int(m.get("sec_lines") or 0)
-                whole = bool(ss and sn and tl and ss == cs and sn == tl)
-                if ss and sn and not whole:
-                    out += f"\n   ├ 行 {ss}~{ss + sn - 1}（{sn} 行）"
-                    if ls and sl and (ss, sn) != (ls, sl):
-                        out += f"\n   │ └ 命中段 行 {ls}~{ls + sl - 1}（{sl} 行）"
-                elif ls and sl:
-                    out += f"\n   ├ 命中段 行 {ls}~{ls + sl - 1}（{sl} 行）"
-            if m.get("path"):
+            _hits = m.get("hits") or []
+            if len(_hits) > 1:
+                # 这张卡命中多处时点一句，模型一眼知道「不止一处对题」，不会读完
+                # 第一段就收工。只命中一处不必说 —— 那是默认形态，说了是噪音。
+                out += f" · 命中 {len(_hits)} 处"
+            out += _hit_tree(m)
+            # 路径行由 `_hit_tree` 统一收口（它要参与树的孩子排序才能只有一个 `└`）。
+            # 没有命中落点时（定位全失败）树是空的，这里兜底补一行，否则这卡没有入口。
+            if m.get("path") and not (m.get("hits") or []):
                 out += f"\n   └ 路径：{m['path']}"
             return out
 
         lines = "\n".join(_row(i, m) for i, m in enumerate(menu, 1))
-        found = len(menu) + more
-        head = (
-            f"知识库检索到 {found} 个相关知识块，这里列最相关的 {len(menu)} 个。"
-            if more
-            else f"知识库检索到 {found} 个相关知识块。"
-        )
+        # 抬头报**卡数**：追加块只是老卡的新落点，不是新卡，不该把数字算进去。
+        head = f"知识库检索到 {len({m['key'] for m in menu})} 个相关知识块。"
         return (
             "<knowledge-base-titles>\n"
             f"{head}\n"
@@ -577,65 +674,32 @@ class KBAutoInjectPlugin:
         candidate_limit: Optional[int] = None,
         tag: str = "retrieve summary",
     ) -> List[Dict[str, Any]]:
-        """统一检索入口：engine.search + min_rerank_score 闸门（唯一真源）。
+        """统一检索入口：注入路径（retrieve_chunk）与主动查库（search_knowledge）共用。
 
-        注入路径（retrieve_chunk）与主动查库（search_knowledge）必须共用本函数。
+        闸门本身在 `hermes_kb.gate.gated_search`（CLI 也调它），这里只负责留痕。
         曾因两条路径各写一份过滤逻辑，显式工具不套闸门、把 rerank=0.00004 的
         噪音原样返回给模型。排序键与阈值只要分叉一次就会静默漂移。
         """
         if not query or len(query.strip()) < 3:
             return []
         try:
-            retrieval_cfg = self.engine.config.get("retrieval", {})
-            candidate_limit = max(
-                1,
-                int(
-                    candidate_limit
-                    if candidate_limit is not None
-                    else retrieval_cfg.get("candidate_limit", 25)
-                ),
-            )
-            if top_k is None:
-                top_k = int(retrieval_cfg.get("rerank_top_n", 25))
-            top_k = max(1, int(top_k))
-            # 只保留分数阈值：min_rerank_score。RRF 分数阈值已按用户要求移除，
-            # 语义是「没有重排分数的切片一律不进」——reranker 超时/失败产生的
-            # rrf_fallback 条目没有 rerank_score，会被当作无效直接丢弃。
-            min_score = float(retrieval_cfg.get("min_rerank_score", 0.85))
-            results = self.engine.search(
-                query,
-                limit=candidate_limit,
-                rerank_top_n=top_k,
-            )
-            valid_results = []
-            _rej_rerank = 0
-            for result in results:
-                score = result.get("rerank_score")
-                if score is None:
-                    _rej_rerank += 1
-                    continue
-                try:
-                    if float(score) >= min_score:
-                        valid_results.append(result)
-                    else:
-                        _rej_rerank += 1
-                except (TypeError, ValueError):
-                    _rej_rerank += 1
-                    continue
+            # 局部导入：理由同 `engine` 属性，hermes_kb 的重库加载推迟到首次真实检索。
+            from hermes_kb.gate import gated_search
 
-            # 断崖截断已按用户要求移除：不再按 top1 分差砍掉后续切片。
-
+            gated = gated_search(
+                self.engine, query, candidate_limit=candidate_limit, top_n=top_k
+            )
             # [留痕] 单行检索摘要：事后可直接回答「阈值卡掉多少张」
             logger.info(
                 "[KBAutoInject] %s: cand=%d kept=%d | rerank<%.2f dropped=%d | q=%s",
                 tag,
-                len(results or []),
-                len(valid_results),
-                min_score,
-                _rej_rerank,
+                gated.candidates,
+                len(gated.kept),
+                gated.min_score,
+                gated.dropped,
                 _short(query, 100),
             )
-            return valid_results
+            return gated.kept
         except Exception as exc:
             logger.warning(
                 "[KBAutoInject] %s error for %r: %s", tag, query[:30], exc
@@ -665,13 +729,20 @@ class KBAutoInjectPlugin:
         入口一：dispatch 层的 kb_query（写在任意工具调用里）。
         入口二：search_knowledge 工具自己的 query。
 
-        ``top_k`` 是喂给 reranker 的候选数；``max_cards`` 是这一屏**印几张**。
-        两者不是一回事：注入路径不截断（一条标题 ~130 字，便宜），
-        只有 search_knowledge 的 ``limit`` 才需要按张数封顶。
+        ``top_k`` 是喂给 reranker 的候选数；``max_cards`` 只在**调用方自己点名**时才设
+        （`search_knowledge` 的 `limit`），注入路径一律不设 —— 过闸的全印。
 
-        序号只增不变：``self._shown`` 记本轮印过的卡，新卡往 `#N+1` 追加，
-        已给出的号永不重排（曾每批重排 → 模型照记忆点序号指错，见
-        20261023_225015_ea5c533c 第 3、4 轮）。
+        只认一道闸：`min_rerank_score`。过了就是合格块，合格块必须出现在清单里。
+        早先这里还有两道我自加的闸（`MENU_MAX_CARDS=6` 卡数、`MENU_BUDGET=4000` 字数），
+        实测把 19 张过闸卡砍到 6 张，等于让 owner 定的阈值形同虚设 —— 阈值说它合格、
+        另一段代码又把它撤掉，两道判据打架。已整体删除。
+
+        去重的尺度是**落点**，不是整张卡。卡标题只印一次（省字），但同一张卡后来
+        又命中了别的段落，那些段落必须补印 —— 早先按整卡拦，实测 5 次工具调用里
+        53 处（占 58%）首次命中的落点被连坐吞掉，模型连那些段落存在都不知道。
+
+        序号只增不变：同一张卡永远同一个 `#N`，新卡往 `#N+1` 追加，已给出的号永不
+        重排（曾每批重排 → 模型照记忆点序号指错，见 20261023_225015_ea5c533c）。
         """
         _q = (query or "").strip()
         if not _kb_query_is_usable(_q):
@@ -691,38 +762,50 @@ class KBAutoInjectPlugin:
             logger.warning("[KBAutoInject] inline retrieve failed: %s", exc)
             _chunks = []
         _screen = self._build_menu(_chunks) if _chunks else []
-        _known = set(self._shown)
-        _fresh_cards = [it for it in _screen if it["key"] not in _known]
-        _cap = max_cards or MENU_MAX_CARDS
-        _pick, _used = [], 0
-        for _it in _fresh_cards[:_cap]:
-            # 估这一张会占多少字：标题行 + 命中链 + 行号/路径两行（约 90 字固定开销）
-            _chain = _it.get("chain") or []
-            _cost = (len(_it.get("title") or "") + sum(len(x) for x in _chain)
-                     + 90 + 14 * len(_chain))
-            if _pick and _used + _cost > MENU_BUDGET:
-                break
-            _pick.append(_it)
-            _used += _cost
-        _more = max(0, len(_fresh_cards) - len(_pick))
-        _fresh_cards = _pick
-        if not _fresh_cards:
+        # 逐卡裁到只留还没印过的落点：新卡全收，老卡只收增量。
+        _batch: List[Dict[str, Any]] = []
+        for it in _screen:
+            _rec = self._shown.get(it["key"])
+            _old = _rec["hits"] if _rec else set()
+            _fresh = [h for h in (it.get("hits") or [])
+                      if (tuple(h.get("chain") or []), int(h.get("a") or 0),
+                          int(h.get("n") or 0)) not in _old]
+            if _rec and not _fresh:
+                continue          # 老卡、零新增落点 —— 真重复，跳过
+            if max_cards is not None and not _rec and len(
+                [x for x in _batch if not x.get("extra")]
+            ) >= max_cards:
+                continue          # 调用方点名的卡数上限，只约束**新卡**
+            _entry = dict(it, hits=_fresh, extra=bool(_rec))
+            if _rec:
+                _entry["no"] = _rec["no"]
+            _batch.append(_entry)
+        if not _batch:
             logger.info(
                 "[KBAutoInject] inline MENU no-new (已印过 %d 张) q=%s",
                 len(self._shown),
                 _short(_q, 70),
             )
             return ""
-        _start = len(self._shown) + 1
-        self._shown.extend(it["key"] for it in _fresh_cards)
+        _new_cards = 0
+        for it in _batch:
+            _rec = self._shown.get(it["key"])
+            if _rec is None:
+                _new_cards += 1
+                it["no"] = len(self._shown) + 1
+                _rec = self._shown[it["key"]] = {"no": it["no"], "hits": set()}
+            _rec["hits"].update(
+                (tuple(h.get("chain") or []), int(h.get("a") or 0), int(h.get("n") or 0))
+                for h in it["hits"]
+            )
         logger.info(
-            "[KBAutoInject] inline MENU EMIT(#%d..#%d of %d) q=%s",
-            _start,
+            "[KBAutoInject] inline MENU EMIT(+%d 卡 / 累计 %d 卡 / %d 段) q=%s",
+            _new_cards,
             len(self._shown),
-            len(self._shown),
+            sum(len(x["hits"]) for x in _batch),
             _short(_q, 70),
         )
-        return self._render_menu(_fresh_cards, start=_start, more=_more)
+        return self._render_menu(_batch)
 
     def handle_pre_llm_call(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
 
@@ -739,7 +822,7 @@ class KBAutoInjectPlugin:
         turn_key = self._turn_key(kwargs)
         # 新一轮：清空「本轮印过的卡」。清单由 dispatch 层当场填，
         # 这里不许再按「上一轮的声明」重放任何东西。
-        self._shown = []
+        self._shown = {}
         self._served_query = ""
         context_parts: List[str] = []
         protocol = self._protocol_context(turn_key)
@@ -751,7 +834,7 @@ class KBAutoInjectPlugin:
         _uq = self._user_query(kwargs)
         if _uq:
             try:
-                _user_menu = self._inline_menu(_uq, max_cards=_USER_QUERY_MAX_CARDS)
+                _user_menu = self._inline_menu(_uq)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "[KBAutoInject] user-query menu failed (%s): %s",

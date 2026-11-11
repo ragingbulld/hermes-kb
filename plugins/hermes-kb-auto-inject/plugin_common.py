@@ -4,12 +4,107 @@
 `KBAutoInjectPlugin` 类在 `.plugin_class`，schema + handler + 注册在 `.registration`。
 """
 
+import contextlib
 import json
+import importlib.util
 import logging
+import os
 import re
-from typing import Any, Dict, List, Tuple
+import sys
+import threading
+from typing import Any, Dict, Iterator, List, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ── hermes_kb 自举：这个插件自己负责把引擎包放到 sys.path 上 ────────────────────
+#
+# 历史（2026-11-06 事故）：`hermes_kb` 住在 $HERMES_HOME/hermes_kb，不在任何
+# site-packages 里，全靠 venv 里一个 `zz-hermes-kb-path.pth`（内容就是 $HERMES_HOME）
+# 进 sys.path。网关是 `python3 -I -c …` 启动的，`-I` 忽略 PYTHONPATH 与 user-site，
+# 所以那个 .pth 是唯一入口。而 .pth 不属任何 pip 包 —— `pm repair / install /
+# update` 每次新建一代 environment 都不会把它带过去，于是「换 generation」这件事
+# 会静默拆掉整条注入链，表现为每轮：
+#
+#     [KBAutoInject] retrieve summary error for '…': No module named 'hermes_kb'
+#
+# 更阴的是它在惰性导入之后才炸：进程起来时插件注册日志一切正常（门禁、schema、
+# 标题清单骨架照打），只有真正检索那一步返回空 —— 表面看不出坏。
+#
+# 治本做法不是再找个地方补 .pth（那本来就是把「插件能不能跑」寄存在一个
+# 没有所有者的外部文件上），而是让**需要这个包的代码自己解析它的位置**：
+# 下面这个函数在 sys.path 里找不到 hermes_kb 时，按「环境变量 → HERMES_HOME →
+# hermes_constants → 从本文件向上找」的顺序定位并挂上，全程只做 sys.path 操作，
+# 不 import 重库，毫秒级，不碰 10s 装载门禁。
+_KB_PKG_NAME = "hermes_kb"
+
+
+def _hermes_kb_candidate_roots() -> "List[str]":
+    """按可信度排序列出「可能装着 hermes_kb 的父目录」。"""
+    roots: "List[str]" = []
+
+    def _add(path: Any) -> None:
+        if not path:
+            return
+        p = os.path.abspath(os.path.expanduser(str(path)))
+        if p and p not in roots:
+            roots.append(p)
+
+    # 1) 显式逃生口：环境变量指哪个父目录就用哪个
+    _add(os.environ.get("HERMES_KB_HOME"))
+    # 2) 官方判据：core 自己的 HERMES_HOME 解析（网关进程里必然正确）
+    try:
+        from hermes_constants import get_hermes_home  # noqa: PLC0415
+
+        _add(get_hermes_home())
+    except Exception:  # noqa: BLE001 - core 换 API 也不能让注入链挂掉
+        pass
+    # 3) 环境变量兜底（-I 下 PYTHONPATH 无效，但 HERMES_HOME 一直是显式导出的）
+    _add(os.environ.get("HERMES_HOME"))
+    # 4) 从本文件向上找：plugins/<name>/ → plugins/ → $HERMES_HOME
+    here = os.path.dirname(os.path.abspath(__file__))
+    _add(os.path.dirname(os.path.dirname(here)))
+    # 5) 最后兜底：默认家目录
+    _add(os.path.join(os.path.expanduser("~"), ".hermes"))
+    return roots
+
+
+def ensure_hermes_kb_importable() -> str:
+    """确保 `import hermes_kb` 可用。返回解析到的父目录（已在 path 上或全部失败则为空串）。
+
+    幂等：能 find_spec 就立刻返回，不重复加路径。定位后**仍然用 find_spec 复核**，
+    避免把「目录存在但不是包」的路径塞进 sys.path 造成后续更难查的 ImportError。
+    """
+    try:
+        if importlib.util.find_spec(_KB_PKG_NAME) is not None:
+            return ""
+    except (ImportError, ValueError):
+        pass
+
+    for root in _hermes_kb_candidate_roots():
+        pkg_dir = os.path.join(root, _KB_PKG_NAME)
+        if not os.path.isfile(os.path.join(pkg_dir, "__init__.py")):
+            continue
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        try:
+            found = importlib.util.find_spec(_KB_PKG_NAME) is not None
+        except (ImportError, ValueError):
+            found = False
+        if found:
+            # 这条日志就是自举生效的留痕：以后换 generation 丢了 .pth，
+            # 它会在每轮检索里以 INFO 出现一次，不必再去 /proc/<pid>/maps 里翻。
+            logger.info(
+                "[KBAutoInject] hermes_kb 自举成功：%s 已挂上 sys.path（venv 里的 "
+                "zz-hermes-kb-path.pth 缺失也能用）", root,
+            )
+            return root
+        sys.path.remove(root)
+    return ""
+
+
+ensure_hermes_kb_importable()
+
 
 # 唯一的元参数：每一次工具调用都要写，本插件用它取知识库检索词，动手前剥掉。
 # 曾经还有 kb_open / kb_keep 两个兄弟参数 + 「一条调用只能写一个」的单槽闸门，
@@ -18,22 +113,56 @@ logger = logging.getLogger(__name__)
 # 也不需要持有任何一块原文。
 KB_FIELD = "kb_query"
 
-# 一屏最多印几张卡 + 这一屏的字数预算。
-# 清单的用途是「零成本筛相关性」，不是把相似度前 25 名全倒出来：实测一次 kb_query
-# 命中 22 张同主题卡，全倒出来 2,400 字，而值得读的通常 1~2 张。
-# **控制手段是少印几张，不是把每张卡的标题/链路截断**（截断省下的正是判断依据）。
-# 标题与命中链一个字不省，靠 `MENU_BUDGET` 兜底：超预算就从尾部撤几张，
-# 抬头照实写「另有 N 张相近卡没印」。
-MENU_MAX_CARDS = 6
-MENU_BUDGET = 4000
-
 # Markdown 标题行：`## 二、xxx`。用于从块头往上找「这一节从哪开始」。
 _HDR_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+# 代码围栏：``` 或 ~~~，允许带缩进与 info string。
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def scan_heads(lines: "List[str]") -> "List[Tuple[int, int, str]]":
+    """扫出 markdown 标题行，**跳过代码围栏内部**。返回 ``[(行下标, 级别, 原文标题)]``。
+
+    为什么必须跳围栏：文档里的 shell / python 示例常写成
+
+        ```bash
+        export HERMES_KB_EMBED_API_KEY=sk-xxx
+        hermes-kb sync
+        # Batch #1 FAILED: embedding failed for 2/2 texts
+        # reindexed: 0 files / 0 chunks
+        ```
+
+    那两行 `# xxx` 是**注释**，`_HDR_RE` 却把它当 H1 认了。后果不是少标一格，而是
+    **把上一节的结束行算错**：父节「一、交付前的标准流程」本该到文件尾，被这条
+    假 H1 截到第 69 行，于是它下面所有子节的 `行 a~b` 全落在父范围之外 ——
+    模型照抄行号读到的是不相干的内容。实测 `framework-packaging-and-fresh-install.md`
+    第 70 行的 `# Batch #1 FAILED...` 就是这么把整棵树带偏的。
+
+    围栏内的 `#` 一律不认；围栏外的才认。围栏本身要求「同种符号、长度不小于开启者」
+    才算闭合（CommonMark 规则），避免 ``` 里的 `~~~` 被误判成闭合。
+    """
+    heads: "List[Tuple[int, int, str]]" = []
+    fence: "tuple[str, int] | None" = None
+    for i, ln in enumerate(lines):
+        fm = _FENCE_RE.match(ln)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = (marker[0], len(marker))
+            elif marker[0] == fence[0] and len(marker) >= fence[1]:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        m = _HDR_RE.match(ln)
+        if m:
+            heads.append((i, len(m.group(1)), m.group(2)))
+    return heads
 
 # dispatch 前要从入参里剥掉的键。第一个是本插件自己的元参数；
 # 后三个是旧 doing 协议的字段（协议已删，检索词只走 kb_query），**但不能跟着删**：
 # 旧会话仍可续用，其历史里 assistant 的 tool_call 带着这些键，模型会照着续写，
-# 裸传给底层工具就是「未知参数」报错。实测会话存档文件里仍有 12 份
+# 裸传给底层工具就是「未知参数」报错。实测 $HERMES_HOME/sessions/ 里仍有 12 份
 # 请求转储带 `"doing":` 键（2026-08-27 ~ 09-28 的长会话）。剥离成本只是一次元组
 # 成员判断，留着是保险，不是尸体。
 _STRIP_KEYS = (KB_FIELD, "doing", "execution_state", "_hermes_execution")
@@ -52,6 +181,40 @@ _EXEMPT_TOOLS = frozenset({
 #   · （历史上的 open_knowledge）—— 它干的是「展开」，不是「检索」，带检索词自相矛盾
 #   · search_knowledge —— 它自己就是查库入口，检索词走它自己的 query 参数
 _NO_KB_FIELD = _EXEMPT_TOOLS | frozenset({"search_knowledge"})
+
+
+# ── execute_code 沙箱作用域 ───────────────────────────────────────────────────
+#
+# 门禁的判据本该是「谁在要这次调用」：模型直接发起的调用是一条决策，值得为它检索
+# 一次库；脚本内部 `hermes_tools.terminal(...)` 转回来的子调用只是实现细节 ——
+# 模型为那一整段只写了外层一条 `execute_code`，那条已经带过 kb_query 了。
+#
+# 判据用 ThreadLocal 而不是 ContextVar 或入参：RPC 处理不一定在当前上下文里跑。
+# session kernel 的 `CellAuthority.dispatch` 会 `ctx.run()` 进 cell 启动时复制的
+# 上下文（tools/code_kernel.py:230），派发期间设的 ContextVar 传不到那一层；而
+# `ctx.run()` 不换线程，同线程的 ThreadLocal 一定看得见。入参传递则需要改 core
+# 的函数签名（`dispatch(tool_name, tool_args)` 是四处实现共用的契约）。
+_KB_SANDBOX_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def sandbox_rpc_scope() -> Iterator[None]:
+    """RPC 处理期间打标记：dispatch 见到它就整段跳过 kb_query 门禁。
+
+    可重入（嵌套计数），异常路径也会退干净 —— 标记泄漏会让之后所有真人调用
+    静默免检，比拦错严重得多。
+    """
+    depth = getattr(_KB_SANDBOX_LOCAL, "depth", 0)
+    _KB_SANDBOX_LOCAL.depth = depth + 1
+    try:
+        yield
+    finally:
+        _KB_SANDBOX_LOCAL.depth = depth
+
+
+def in_sandbox_rpc() -> bool:
+    """当前线程是否正处在一次 execute_code 的 RPC 子调用里。"""
+    return getattr(_KB_SANDBOX_LOCAL, "depth", 0) > 0
 
 
 def _is_guard_layer(value: Any, want_name: str) -> bool:
@@ -204,7 +367,6 @@ def _short(text: Any, limit: int = 140) -> str:
 #     拿会话摘要去检索，只会捞到元讨论
 #   · 零信息量短消息（「嗯」「继续」「做」）—— 检索必跑偏，宁可不检索
 _USER_QUERY_MAX_CHARS = 400     # 送进检索的用户原话上限（超出取首尾各一半）
-_USER_QUERY_MAX_CARDS = 3       # 用户路径这一屏最多印几张（成本闸门）
 _USER_QUERY_MIN_CHARS = 6       # 少于此长度整条不检索
 
 _USER_QUERY_NOISE_RE = re.compile(
@@ -282,13 +444,26 @@ PROTOCOL_PROMPT = """【工具调用协议：kb_query】
 
 **字面抄不出来，就是你还该先去看，不是先去检索。**
 
+**判据一句话：这个词有没有可能出现在某张卡的标题或正文里？答不上来 = 不许写。**
+
 | 禁止 | 为什么 |
 |---|---|
 | 照抄用户原话 | 那是**要求**（去掉/优化/看看/有没有更好的），要求里没有检索词 |
-| 动作词：去掉 / 优化 / 排查 / 修复 / 继续 / 确认 | 实测加 12 个动作词，0.9953 → 0.8226 |
+| 只写意图（`继续排查检查确认`） | 意图永远只有那几个词，写完等于没写；**写现象**：`配置删了但还在触发` |
+| 本轮自己生成的临时名（`a1.jpg` / `tmp` / `out.jpg`） | 按字面规则合法，但库里永远不会有，判别性被稀释成 0 = 空转 |
 | 评价词：更优雅 / 太慢 / 不正常 | 库里没人这么写 |
 | 替库想象卡名 | 编一个库里没有的词：0.9995 → 0.3718，被阈值直接砍死 |
 | `none` / `null` / 空串 / `无` | 没有「这条跳过」这种写法，一律打回 |
+
+真实反例（左=用户原话，右=该写的）：
+
+| 用户说的 | 别写 | 该写 |
+|---|---|---|
+| 去掉自动移除 | `去掉自动移除` | `--auto-remove-failed-url Config.Cmd` |
+| 看看其他线路 | `看看其他线路 线路切换` | `pppoe-out-dx pppoe-out-lt flags RUNNING` |
+| 计费对不上 | `计费对不上` | `usage_ledger attempts=0 unmatched` |
+| 右边还是有空白 | `右边有空白` | `space-y-2 p-3 margin` |
+| 找产品图 | `翅根 示意图｜a1.jpg 裁剪` | `翅根 白底 产品图｜Bing 图片 murl` |
 
 写完当场生效：这条工具结果后面立刻多一屏**标题清单**（标题、命中小节、绝对路径、
 命中断在原文的行号）。要正文就 `read_file` 那个路径，行号照抄清单里的，别整卡乱读。

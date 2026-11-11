@@ -57,6 +57,6 @@ def search_knowledge_handler(args: dict[str, Any], **kw: Any) -> str:
         return body
     return (
         f"<knowledge-base-note>「{_short(query, 60)}」没捞到新卡"
-        "（要么过了 0.85 闸门的一张都没有，要么这些卡本轮清单里已经给过了）。"
+        "（要么过了重排闸门的一张都没有，要么这些卡本轮清单里已经给过了）。"
         "换词重试：抄你眼睛看见的报错原文/字段名/路径，别用评价词。</knowledge-base-note>"
     )
