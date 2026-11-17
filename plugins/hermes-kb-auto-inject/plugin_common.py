@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ── hermes_kb 自举：这个插件自己负责把引擎包放到 sys.path 上 ────────────────────
 #
 # 历史（2026-11-06 事故）：`hermes_kb` 住在 $HERMES_HOME/hermes_kb，不在任何
-# site-packages 里，全靠 venv 里一个 `zz-hermes-kb-path.pth`（内容就是 $HERMES_HOME）
+# site-packages 里，全靠 venv 里一个 `zz-hermes-kb-path.pth`（内容是 Hermes 安装根目录）
 # 进 sys.path。网关是 `python3 -I -c …` 启动的，`-I` 忽略 PYTHONPATH 与 user-site，
 # 所以那个 .pth 是唯一入口。而 .pth 不属任何 pip 包 —— `pm repair / install /
 # update` 每次新建一代 environment 都不会把它带过去，于是「换 generation」这件事
@@ -162,7 +162,7 @@ def scan_heads(lines: "List[str]") -> "List[Tuple[int, int, str]]":
 # dispatch 前要从入参里剥掉的键。第一个是本插件自己的元参数；
 # 后三个是旧 doing 协议的字段（协议已删，检索词只走 kb_query），**但不能跟着删**：
 # 旧会话仍可续用，其历史里 assistant 的 tool_call 带着这些键，模型会照着续写，
-# 裸传给底层工具就是「未知参数」报错。实测 $HERMES_HOME/sessions/ 里仍有 12 份
+# 裸传给底层工具就是「未知参数」报错。实测 `$HERMES_HOME/sessions/` 里仍有 12 份
 # 请求转储带 `"doing":` 键（2026-08-27 ~ 09-28 的长会话）。剥离成本只是一次元组
 # 成员判断，留着是保险，不是尸体。
 _STRIP_KEYS = (KB_FIELD, "doing", "execution_state", "_hermes_execution")
@@ -426,45 +426,31 @@ def _content_text(content: Any) -> str:
     return ""
 
 
-PROTOCOL_PROMPT = """【工具调用协议：kb_query】
+# 所有提示面共用写法规则；必填与桥形态另述，避免多份文案互相漂移。
+QUERY_WRITING_GUIDE = """写清「已知对象＋具体问题」：对象是产品、服务、模块或页面；问题可以是现象、用法或要了解的关系。用自然短句即可，不强制分段或堆满专名。
+从当前对话已明确的上下文补上对象，保留用户原话中有用的描述；报错、字段名、值、命令和版本号原样保留。信息来自当前对话、调用参数、工具返回或已读文件，不猜对象、错误码、根因或卡名。
+首次还没有日志时，用已知对象＋当前问题先检索；对象也未知时保留具体描述，后续取得真实信息再细化。不为凑字段编词，不必先知道答案里的术语。
+不要只写「继续检查确认」这类意图，也不要用本轮临时文件名或无关词凑数；表达问题所需的口语、动词和关系词可以保留。""".strip()
 
-每一次工具调用都必须写 `kb_query`。它只干一件事：**把库里那张对的卡捞出来**，不是任务描述。
+QUERY_WRITING_EXAMPLES = """例（对象和字段必须已知，不能照例猜填）：
+- 已在讨论 NapCat：机器人显示在线但消息发不出去 → `NapCat 机器人显示在线但消息发不出去`
+- 问 MCSManager 用法 → `MCSManager 怎么通过 API 开服并判断服务器就绪`
+- 已见 RouterOS 字段 → `RouterOS scheduler 的 next-run 为空，run-count=0`
+- 已见自动移除参数 → `traffic-consumer --auto-remove-failed-url 自动移除失败链接`""".strip()
 
-**形状：三段，用 `｜` 隔开，一段都不能空 —— `病灶现象｜目标对象｜专名`**
+KB_QUERY_REQUIREMENT = "每次需要此字段的工具调用都要填写；空串 / none / null / 无 等弃权值会被打回。"
+KB_QUERY_DESCRIPTION = "\n".join((
+    "知识库检索词，用来找到与当前问题有关的资料。",
+    QUERY_WRITING_GUIDE,
+    QUERY_WRITING_EXAMPLES,
+    KB_QUERY_REQUIREMENT,
+))
 
-| 段 | 抄什么 |
-|---|---|
-| ① 病灶现象 | 你眼睛看见的原文：报错、字段值、状态、参数名 |
-| ② 目标对象 | 哪个容器 / 服务 / 文件 / 模块 / 页面 |
-| ③ 专名 | 这件事独有的 1~3 个标识符（字段名、参数名、路径、版本号） |
-
-`URLs (0个) 未找到可用的下载链接｜traffic-consumer 容器｜--auto-remove-failed-url Config.Cmd`
-
-字面只认四处：用户这番话里的产品名/文件名/报错、工具调用参数、工具返回值、本轮读到的文件。原样抄，大小写和 `-` `_` `.` 一个都别改。
-
-**字面抄不出来，就是你还该先去看，不是先去检索。**
-
-**判据一句话：这个词有没有可能出现在某张卡的标题或正文里？答不上来 = 不许写。**
-
-| 禁止 | 为什么 |
-|---|---|
-| 照抄用户原话 | 那是**要求**（去掉/优化/看看/有没有更好的），要求里没有检索词 |
-| 只写意图（`继续排查检查确认`） | 意图永远只有那几个词，写完等于没写；**写现象**：`配置删了但还在触发` |
-| 本轮自己生成的临时名（`a1.jpg` / `tmp` / `out.jpg`） | 按字面规则合法，但库里永远不会有，判别性被稀释成 0 = 空转 |
-| 评价词：更优雅 / 太慢 / 不正常 | 库里没人这么写 |
-| 替库想象卡名 | 编一个库里没有的词：0.9995 → 0.3718，被阈值直接砍死 |
-| `none` / `null` / 空串 / `无` | 没有「这条跳过」这种写法，一律打回 |
-
-真实反例（左=用户原话，右=该写的）：
-
-| 用户说的 | 别写 | 该写 |
-|---|---|---|
-| 去掉自动移除 | `去掉自动移除` | `--auto-remove-failed-url Config.Cmd` |
-| 看看其他线路 | `看看其他线路 线路切换` | `pppoe-out-dx pppoe-out-lt flags RUNNING` |
-| 计费对不上 | `计费对不上` | `usage_ledger attempts=0 unmatched` |
-| 右边还是有空白 | `右边有空白` | `space-y-2 p-3 margin` |
-| 找产品图 | `翅根 示意图｜a1.jpg 裁剪` | `翅根 白底 产品图｜Bing 图片 murl` |
-
-写完当场生效：这条工具结果后面立刻多一屏**标题清单**（标题、命中小节、绝对路径、
-命中断在原文的行号）。要正文就 `read_file` 那个路径，行号照抄清单里的，别整卡乱读。
-经 `tool_call` 桥调用时，`kb_query` 写在 `calls[].arguments` 内层。""".strip()
+PROTOCOL_PROMPT = "\n\n".join((
+    "【工具调用协议：kb_query】\n\n每一次要求此字段的工具调用都要写 `kb_query`，用于查找与当前问题有关的知识。",
+    QUERY_WRITING_GUIDE,
+    QUERY_WRITING_EXAMPLES,
+    KB_QUERY_REQUIREMENT,
+    "检索有新结果时，标题清单会附在这条工具结果后。正文按清单给出的绝对路径和行号用 `read_file` 读取。\n"
+    "经 `tool_call` 桥调用时，`kb_query` 写在 `calls[].arguments` 内层。",
+))

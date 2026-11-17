@@ -32,6 +32,20 @@ __all__ = [
     "SEARCH_KB_SCHEMA",
 ]
 
+# KB 工具图标只在 `hermes-kb-write` 里登记一份真源（它同时管写/改/删三个工具），
+# 这里按软引用去取，避免两处各写一个 emoji 各自漂移。兄弟插件缺席时用同一个字面量
+# 兜底 —— 图标不值得让工具注册失败。
+_KB_TOOL_EMOJI_FALLBACK = {"search_knowledge": "📇"}
+
+
+def _kb_tool_emoji(tool_name: str) -> str:
+    """Return the KB-family glyph for *tool_name* from the shared table, else the fallback."""
+    try:
+        from hermes_plugins.hermes_kb_write import TOOL_EMOJI
+    except ImportError:                      # 兄弟插件未装 / 未加载：用本地同值兜底
+        return _KB_TOOL_EMOJI_FALLBACK.get(tool_name, "")
+    return TOOL_EMOJI.get(tool_name) or _KB_TOOL_EMOJI_FALLBACK.get(tool_name, "")
+
 
 def register(ctx: Any) -> None:
     """注册三样东西：pre_llm_call 钩子（唯一注入点，块直接落 api_content）、
@@ -61,6 +75,7 @@ def register(ctx: Any) -> None:
         schema=SEARCH_KB_SCHEMA,
         handler=search_knowledge_handler,
         check_fn=lambda: True,
+        emoji=_kb_tool_emoji("search_knowledge"),
     )
 
     # 自检三：registry 出口实测。注册完当场把名字喂回 `get_definitions`，

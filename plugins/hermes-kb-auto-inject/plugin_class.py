@@ -507,7 +507,7 @@ class KBAutoInjectPlugin:
         """
         _chain_spans = self._chain_spans
 
-        def _hit_tree(m: Dict[str, Any], tail: bool = True) -> str:
+        def _hit_tree(m: Dict[str, Any]) -> str:
             """把这张卡的全部命中落点合并成**一棵**树。
 
             为什么要合并：同一小节常被切出好几片（一张卡 12 块里 4 块同属
@@ -523,8 +523,11 @@ class KBAutoInjectPlugin:
             每一级仍带自己的 `· N 字 · 行 a~b（n 行）` —— 那个范围是**整节**的，
             和叶子上的「命中段」是两个不同粒度，都要给。
 
-            ``tail=False`` 省掉末尾的 `路径` 行：老卡的追加块，路径在上一条消息里
-            已经给过，再抄一遍纯属重复。
+            路径行一律印：一棵树只有一个入口，就是它自己的绝对路径。早先给老卡的
+            「追加块」开过 `tail=False` 省这一行（理由：路径上一条消息里给过），
+            但省掉之后那一行只剩 `#N ↑ 追加 M 处命中`，**卡标题和路径双双缺席**，
+            模型拿不到「这是什么卡、文件在哪」这两个判断入口，等于有坐标没对象。
+            追加形态已整体删除，这里不再有第二个分支。
             """
             hits = [h for h in (m.get("hits") or [])
                     if int(h.get("a") or 0) and int(h.get("n") or 0)]
@@ -558,8 +561,12 @@ class KBAutoInjectPlugin:
 
             out: List[str] = []
 
-            def walk(node: Dict[str, Any], prefix: str, segs: List[str],
-                     tail: str = "") -> None:
+            # 路径行永远印（见 docstring：一棵树只有一个入口）。做成闭包变量而不是
+            # `walk` 的形参 —— 早先它是形参、只有根层传值，等于给「不印路径」留了个
+            # 只有追加块在用的暗门。
+            _tail = str(m.get("path") or "")
+
+            def walk(node: Dict[str, Any], prefix: str, segs: List[str]) -> None:
                 """深度优先画这一层。孩子与叶子**按原文行号排序**（文档顺序）。
 
                 早先孩子按「首次出现」排（= 检索序），于是同一张卡的树长成
@@ -579,11 +586,13 @@ class KBAutoInjectPlugin:
                     items.append((ka or 10 ** 9, "kid", node["children"][s]))
                 for l in leaves:
                     items.append((l[0], "leaf", l))
-                if tail:
+                if _tail and not segs:
+                    # 只在**根层**印路径行（`segs` 为空即根）：递归时的 children 各自
+                    # 不印，否则一棵树每层都挂一条路径。
                     # 路径行跟树的孩子同级，必须**参与** last 判定：早先它被硬编码成
                     # `└ 路径`，于是根层既有一个 `└` 收尾的分支、又有一个 `└ 路径`，
                     # 一棵树长出两个收口，垂线视觉上是断的。永远排最后。
-                    items.append((10 ** 10, "tail", tail))
+                    items.append((10 ** 10, "tail", _tail))
                 items.sort(key=lambda x: x[0])
                 for idx, (_key, kind, val) in enumerate(items):
                     last = idx == len(items) - 1
@@ -605,19 +614,13 @@ class KBAutoInjectPlugin:
                     else:
                         out.append(f"{_mark(prefix, last)}路径：{val}")
 
-            _tail = str(m.get("path") or "")
-            walk(root, "   ", [], _tail if tail else "")
+            walk(root, "   ", [])
             return ("\n" + "\n".join(out)) if out else ""
 
         def _row(i: int, m: Dict[str, Any]) -> str:
             # 序号由记账层（_inline_menu）给，同一张卡永远同一个号；直接拿未编号的
             # 菜单来渲染时（离线验证脚本）就地按顺序编，不留 `#0` 这种假地址。
             no = m.get("no") or i
-            if m.get("extra"):
-                # 老卡的新落点：卡标题那一行上一条消息里已经印过，不重印（省字），
-                # 只补这一批还没给过的命中段；路径同上，也不再抄一遍。
-                return (f"#{no} ↑ 追加 {len(m['hits'])} 处命中"
-                        + _hit_tree(m, tail=False))
             # 大标题行 = 这张卡的身份 + 整卡体量。体量决定「整篇读还是只读一段」，
             # 是卡的属性，就该跟卡标题在一起。
             out = f"#{no} {m['title']}"
@@ -647,7 +650,7 @@ class KBAutoInjectPlugin:
             return out
 
         lines = "\n".join(_row(i, m) for i, m in enumerate(menu, 1))
-        # 抬头报**卡数**：追加块只是老卡的新落点，不是新卡，不该把数字算进去。
+        # 抬头报**卡数**：每行一张卡（老卡有新落点时重印的仍是同一张卡，不会重复计数）。
         head = f"知识库检索到 {len({m['key'] for m in menu})} 个相关知识块。"
         return (
             "<knowledge-base-titles>\n"
@@ -740,6 +743,9 @@ class KBAutoInjectPlugin:
         去重的尺度是**落点**，不是整张卡。卡标题只印一次（省字），但同一张卡后来
         又命中了别的段落，那些段落必须补印 —— 早先按整卡拦，实测 5 次工具调用里
         53 处（占 58%）首次命中的落点被连坐吞掉，模型连那些段落存在都不知道。
+        **补印时整行重印**（标题 + 体量 + 新落点树 + 路径），不搞「↑ 追加 N 处命中」
+        那种只剩坐标的残行：残行既没有卡标题也没有路径，模型看得见行号却不知道
+        是哪张卡、文件在哪，等于有坐标没对象。
 
         序号只增不变：同一张卡永远同一个 `#N`，新卡往 `#N+1` 追加，已给出的号永不
         重排（曾每批重排 → 模型照记忆点序号指错，见 20261023_225015_ea5c533c）。
@@ -763,7 +769,11 @@ class KBAutoInjectPlugin:
             _chunks = []
         _screen = self._build_menu(_chunks) if _chunks else []
         # 逐卡裁到只留还没印过的落点：新卡全收，老卡只收增量。
+        # 老卡有新落点时**整行重印**（#N + 卡标题 + 整卡体量 + 这棵新命中树 + 路径），
+        # 早先省字省成 `#N ↑ 追加 M 处命中`：标题和路径双双缺席，模型拿到一串行号
+        # 却不知道是哪张卡、文件在哪 —— 有坐标没对象。省下的那点字远不值这个损失。
         _batch: List[Dict[str, Any]] = []
+        _new_in_batch = 0
         for it in _screen:
             _rec = self._shown.get(it["key"])
             _old = _rec["hits"] if _rec else set()
@@ -772,13 +782,13 @@ class KBAutoInjectPlugin:
                           int(h.get("n") or 0)) not in _old]
             if _rec and not _fresh:
                 continue          # 老卡、零新增落点 —— 真重复，跳过
-            if max_cards is not None and not _rec and len(
-                [x for x in _batch if not x.get("extra")]
-            ) >= max_cards:
+            if max_cards is not None and not _rec and _new_in_batch >= max_cards:
                 continue          # 调用方点名的卡数上限，只约束**新卡**
-            _entry = dict(it, hits=_fresh, extra=bool(_rec))
+            _entry = dict(it, hits=_fresh)
             if _rec:
                 _entry["no"] = _rec["no"]
+            else:
+                _new_in_batch += 1
             _batch.append(_entry)
         if not _batch:
             logger.info(

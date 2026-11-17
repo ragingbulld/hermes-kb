@@ -230,7 +230,8 @@ class KBEngine:
                     token_estimate INTEGER DEFAULT 0,
                     vector        BLOB NOT NULL,
                     updated_at    REAL NOT NULL,
-                    text_hash     TEXT
+                    text_hash     TEXT,
+                    part_index    INTEGER DEFAULT 0
                 )
                 """
             )
@@ -243,6 +244,14 @@ class KBEngine:
             if "text_hash" not in existing_cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN text_hash TEXT")
                 logger.info("[KBEngine] migrated chunks: added text_hash column")
+            if "part_index" not in existing_cols:
+                # 同一节被切成多片时的序号（1 起），整节一块记 0。
+                # 以前靠把 " (Part N)" 拼进 heading_path 表达，污染了标题；
+                # 现在位置单独存，老数据一律 0（没这个信息，不猜）。
+                conn.execute(
+                    "ALTER TABLE chunks ADD COLUMN part_index INTEGER DEFAULT 0"
+                )
+                logger.info("[KBEngine] migrated chunks: added part_index column")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(file_path)"
             )
@@ -685,15 +694,16 @@ class KBEngine:
                     """
                     INSERT INTO chunks
                         (chunk_id, file_path, heading_path, title, content,
-                         token_estimate, vector, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?)
+                         token_estimate, vector, updated_at, part_index)
+                    VALUES (?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(chunk_id) DO UPDATE SET
                         content=excluded.content,
                         heading_path=excluded.heading_path,
                         title=excluded.title,
                         token_estimate=excluded.token_estimate,
                         vector=excluded.vector,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        part_index=excluded.part_index
                     """,
                     (
                         chunk_id,
@@ -704,6 +714,7 @@ class KBEngine:
                         token_estimate,
                         vec_blob,
                         now,
+                        int(c.get("part_index") or 0),
                     ),
                 )
                 row_id = cur.lastrowid
@@ -936,8 +947,8 @@ class KBEngine:
                     """
                     INSERT INTO chunks
                         (chunk_id, file_path, heading_path, title, content,
-                         token_estimate, vector, updated_at, text_hash)
-                    VALUES (?,?,?,?,?,?,?,?,?)
+                         token_estimate, vector, updated_at, text_hash, part_index)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(chunk_id) DO UPDATE SET
                         file_path=excluded.file_path,
                         content=excluded.content,
@@ -946,12 +957,13 @@ class KBEngine:
                         token_estimate=excluded.token_estimate,
                         vector=excluded.vector,
                         updated_at=excluded.updated_at,
-                        text_hash=excluded.text_hash
+                        text_hash=excluded.text_hash,
+                        part_index=excluded.part_index
                     """,
                     (
                         chunk_id, file_path, heading, title, content,
                         token_estimate, np.asarray(v, dtype=np.float32).tobytes(), now,
-                        text_hash,
+                        text_hash, int(c.get("part_index") or 0),
                     ),
                 )
                 row_id = cur.lastrowid
@@ -1100,7 +1112,7 @@ class KBEngine:
 
     # ------------------------------------------------------------------ 检索
     def _row_to_item(self, row):
-        _, chunk_id, fpath, heading, title, content, tok, updated = row
+        _, chunk_id, fpath, heading, title, content, tok, updated, part_index = row
         return {
             "id": str(chunk_id),
             "chunk_id": chunk_id,
@@ -1110,6 +1122,9 @@ class KBEngine:
             "content": content,
             "token_estimate": tok,
             "updated_at": updated,
+            # 同一节被切成多片时的序号（1 起），整节一块为 0。
+            # 老数据没有这个信息，一律 0 —— 不用「在标题里找 Part」去反推。
+            "part_index": int(part_index or 0),
         }
 
     def search(
@@ -1167,7 +1182,7 @@ class KBEngine:
                         rows = {
                             r[0]: r
                             for r in conn.execute(
-                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at FROM chunks WHERE id IN ({ph})",
+                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index FROM chunks WHERE id IN ({ph})",
                                 hit_ids,
                             )
                         }
@@ -1226,7 +1241,7 @@ class KBEngine:
                         rows = {
                             r[0]: r
                             for r in conn.execute(
-                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at FROM chunks WHERE id IN ({ph})",
+                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index FROM chunks WHERE id IN ({ph})",
                                 hit_ids,
                             )
                         }

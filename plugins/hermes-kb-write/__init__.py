@@ -37,7 +37,21 @@ from typing import Any
 
 logger = logging.getLogger("hermes_kb_write")
 
-# ── KB 规约路径（双根镜像） ────────────────────────────────────────────────────
+# ── 工具行图标（单一真源）─────────────────────────────────────────────────────
+# 用户看得见的那一行由 `get_tool_emoji()` 解析：skin.tool_emojis > registry > 默认 ⚙️。
+# 不在这里登记就会掉到 ⚙️（齿轮），和工具语义无关。四个 KB 工具统一成「卡片」一族的
+# 单 codepoint 字形（ZWJ 序列在 TUI 里宽度会算错），并避开核心已占用的字符：
+#   core 已占用 ── read_file 📖 / write_file ✍️ / skill_manage 📝 / search_files 🔎 / patch 🔧
+#   skills 占用 ── 📚
+# 语义链：📇 翻索引查 → 🗃️ 新卡入库 → ✏️ 改已有卡 → 🗑️ 删卡
+TOOL_EMOJI = {
+    "search_knowledge": "📇",       # 索引卡盒：按语义翻找卡片（搜索侧，见 hermes-kb-auto-inject）
+    "save_reflection": "🗃️",        # 卡片盒：把本轮成果作为一张新卡收进去
+    "edit_reflection_card": "✏️",   # 铅笔：在已有卡上改字（insert / replace）
+    "delete_reflection_card": "🗑️",  # 垃圾桶：删卡（唯一不可恢复的出口）
+}
+
+# ── KB 规约路径（与 hermes-kb-reflection 保持一致，双根镜像） ──────────────────
 # 双根落盘目录。两个根都写同一份卡（md5 一致），索引只建一份。
 # 用环境变量覆盖，不写死：KB_REFLECTIONS_INBOX_DIR / KB_REFLECTIONS_LOCAL_DIR
 REFLECTIONS_INBOX_DIR = os.environ.get(
@@ -65,48 +79,32 @@ JUDGE_MODE = (os.environ.get("KB_WRITE_DUP_JUDGE") or "1").strip().lower() not i
 )
 DUP_SNIPPET_CHARS = int(os.environ.get("KB_WRITE_DUP_SNIPPET_CHARS") or "400")
 
+# ── 内容原则：主线程、工具与收尾复查共用，避免各自维护相反规则 ──────────────
+REFLECTION_CONTENT_POLICY = """记录值得以后复用的信息，由你根据内容选择结构、篇幅和分类；不要求固定小节、固定顺序或字数，也不要求每次都写。
+优先保留能帮助以后判断和行动的事实、结论、适用条件、证据、做法与取舍。确实发生过的失败尝试值得记录；没有就不用编造或凑齐栏目。未经验证的内容应注明不确定性，不要写成定论。
+维护已有内容和新建同样重要：先读候选原文，核对是否同一个对象和主题。已有内容仍正确且有新增信息时可插入；原文有错或已经过时，就用 replace 直接纠正，或用 delete 删掉失效片段，别在文末追加相反结论而保留错误原文供检索。
+整卡错误、空壳、重复、已被合并或取代且没有独立价值时，调用 delete_reflection_card 清掉文件和索引。部分内容仍有价值就只改删相关部分；有用的历史教训注明适用条件后可保留。不要因为格式、篇幅或检索分数高就删卡，也不要全库扫删。
+查重只提供候选，分数不替你判断：同题维护旧卡，不同题才 force=true 新建。没有新增价值就不写；拿不准就保留并说明不确定点。不要写占位卡来换路径，找卡用 edit_reflection_card(mode="find", query="目标特有的产品名、路径、字段或报错")。
+改删只限本轮有证据涉及的卡；操作前读原文。整卡删除时 confirm_title 逐字填文件 H1；一个文件含多张卡时只精确改删目标部分，避免牵连其他内容。"""
+
 # ── 工具 schema ───────────────────────────────────────────────────────────────
 SAVE_REFLECTION_SCHEMA = {
     "name": "save_reflection",
-    "description": (
-        "把本轮具备长期复用价值的技术成果沉淀成一张 Markdown 反思卡进知识库。\n"
-        "【什么时候该调用】仅当本轮出现了真正的实质交付：\n"
-        "  1. 排障与根治：定位并根治了系统/服务/脚本的 Bug、Crash、性能卡顿；\n"
-        "  2. 工具与流水线开发：从零搭建或重构了自动化工具、CLI、复合调用流水线；\n"
-        "  3. 规约与适配补丁：实装了协议适配、平台差异兜底、配置安全调优。\n"
-        "【什么时候不要调用】查状态、读文件、纯问答、闲聊、无结论的中间步骤 —— "
-        "直接不调用，宁可什么都不写。灌水卡会污染检索。\n"
-        "【查重命中不替你下结论】写卡前会用语义检索比对库内已有卡；命中高分候选时返回 "
-        "action_required=judge_duplicate + candidates（`title`=卡片 H1 / `section`=命中小节 / "
-        "`snippet`=正文片段 / 分数）。先看 title 判是否同一张卡，再看 section 与 snippet 核细节："
-        "同一主题且那张卡仍然成立 → 不要重复沉淀，改用 edit_reflection_card(mode=\"insert\") 追加；"
-        "**那张卡本身是错的（结论被证伪 / 根因写错 / 占位空壳 / 已被更完整的卡取代）→ 不要 insert 续命，"
-        "用 delete_reflection_card 删掉再写正确的新卡**；确为新主题 → 再次调用并带 force=true。\n"
-        "【禁止占位】任何时候都不要用本工具写「占位 / 登记 / 待填 / 无效」这类空壳卡 —— "
-        "要拿已有卡路径请用 edit_reflection_card(mode=\"find\", query=...)，不要把 save_reflection 当「占位登记」。\n"
-        "【失败路径最值钱】务必写清「先试了什么、为什么不行」，这是检索时最有用的部分。"
-    ),
+    "description": "记录可复用知识到 Markdown 反思卡，写前自动查重。\n" + REFLECTION_CONTENT_POLICY,
     "parameters": {
         "type": "object",
         "properties": {
             "title": {
                 "type": "string",
-                "description": "卡片标题，须含核心技术术语与目标对象，禁用『修复了一个bug』这类空泛标题。",
+                "description": "能辨认目标对象和主题的标题，便于日后检索。",
             },
             "body": {
                 "type": "string",
-                "description": (
-                    "卡片正文 Markdown。必须含四个小节：\n"
-                    "- **触发场景 / 业务背景**：什么现象、什么任务引发\n"
-                    "- **根本原因与核心设计**：root cause 与机制，带代码/配置证据\n"
-                    "- **标准解决步骤 / CLI使用 / 关键代码**：可复现的命令与参数\n"
-                    "- **避坑铁律与硬性约束**：走死的路、血泪教训\n"
-                ),
+                "description": "Markdown 正文，按内容自由组织；只记录有依据、值得保留的信息，不必套模板。",
             },
             "kind": {
                 "type": "string",
-                "enum": ["排障SOP", "经验", "工具链路", "规约SOP"],
-                "description": "卡片分类，用于生成文件名前缀。",
+                "description": "可选分类，自由命名；省略时归为经验。",
             },
             "tags": {
                 "type": "array",
@@ -494,7 +492,7 @@ EDIT_REFLECTION_SCHEMA = {
         "**只命中 1 处**，命中 0 处或 >1 处一律拒写。`new_string` 传空串 = 删掉这段。\n"
         "【mode=delete】删掉 `old_string` 那一段（等价 replace + 空 new_string，语义更明确）。\n"
         "【硬约束】只允许 reflections 双根目录下的 .md；双根 md5 不一致拒写；"
-        "后台收尾线程（SOP fork）只放行 find / insert，replace / delete 在 handler 内硬拦。"
+        "主线程与 SOP 收尾复查均可据证据改删。错误、过时原文应直接纠正或删除，不要只追加反向结论。"
     ),
     "parameters": {
         "type": "object",
@@ -572,7 +570,7 @@ DELETE_REFLECTION_SCHEMA = {
         "【删前必做】先 edit_reflection_card(mode=\"find\") 或用候选里的 path/title 确认目标卡就是你要删的那张；"
         "删除不可逆，没有回收站。\n"
         "【删后】写正确的新卡，或一句话说明「删了哪张、为什么」。\n"
-        "【硬约束】只允许 reflections 双根目录下的 .md；confirm_title 不匹配拒删；后台收尾线程（SOP fork）无权调用。\n"
+        "【硬约束】只允许 reflections 双根目录下的 .md；confirm_title 不匹配拒删；SOP 收尾复查可在同样保护下删除已确认失效的卡。\n"
         "【多 H1 守卫】若该 .md 里合了多张卡（多个 `# ` 行），本工具**拒绝删除**并回报 h1_titles —— "
         "整文件 os.remove 会连带销毁其它卡（不可恢复）。改用 edit_reflection_card(mode=\"replace\"/\"delete\") 精确删那一段，"
         "或先把文件拆成一文件一卡。"
@@ -687,6 +685,17 @@ def _resolve_card_paths_lenient(card_path: Any) -> list[str]:
 def _count_chunks_for(path: str) -> int:
     """数索引里某个 file_path 还剩多少切片（回读验收用；-1 = 查不到）。"""
     eng = _get_engine()
+    if eng and hasattr(eng, "kb_path"):
+        import sqlite3
+        try:
+            from pathlib import Path
+            with sqlite3.connect(Path(eng.kb_path).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                return int(conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE file_path = ?", (path,)
+                ).fetchone()[0])
+        except Exception:
+            logger.warning("[KBWrite] SQLite 残留切片计数失败", exc_info=True)
+            return -1
     table = getattr(eng, "table", None) if eng else None
     if table is None:
         return -1
@@ -708,8 +717,8 @@ def _index_path_variants(p: str) -> list[str]:
     """同一张卡在索引里可能出现的所有 file_path 写法。
 
     `delete_by_file_path()` 是**字面精确匹配**（`WHERE file_path = ?`），而索引键来自
-    watcher 扫描时的路径字面。双根为同一实体后，卡可能以两根各自的写法入索引
-    （同一个文件、两个不同前缀）；只删其中一种会静默留下另一半脏切片。
+    watcher 扫描时的路径字面。双根为同一实体后，卡可能以 local 根或 inbox 根
+    任一种写法入索引；只删其中一种会静默留下另一半脏切片。
     """
     base = os.path.basename(p)
     out: list[str] = []
@@ -733,7 +742,7 @@ def _purge_index_for(paths: list[str]) -> dict:
     eng = _get_engine()
     for p in paths:
         if not eng:
-            out[p] = {"purged": False, "residual_chunks": -1, "error": "lancedb 引擎不可用"}
+            out[p] = {"purged": False, "residual_chunks": -1, "error": "知识库引擎不可用"}
             continue
         variants = _index_path_variants(p)
         purged_all, errs = True, []
@@ -741,8 +750,10 @@ def _purge_index_for(paths: list[str]) -> dict:
             try:
                 purged_all = bool(eng.delete_by_file_path(v)) and purged_all
             except Exception as e:
+                purged_all = False
                 errs.append(f"{v}: {e}")
-        residual = max(_count_chunks_for(v) for v in variants)
+        counts = [_count_chunks_for(v) for v in variants]
+        residual = sum(counts) if all(n >= 0 for n in counts) else -1
         out[p] = {
             "purged": purged_all,
             "residual_chunks": residual,
@@ -847,10 +858,7 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
     2026-10-07 owner 指令「简化工具，只留新建、删除、修改」：把 append_to_reflection 与
     find_reflection_card 两条独立工具并入本 handler 的 mode 分支。
 
-    **mode 级安全闸**：``hermes_cli.plugins`` 的线程工具白名单只按**工具名**拦截
-    （``allowed is not None and tool_name not in allowed`` → block），**不解析 mode**。
-    所以 edit 进 fork 白名单 ≠ fork 有删改权 —— 这里必须自查"当前线程是否受限"，
-    受限线程只放行 find / insert。
+    SOP 收尾复查与主线程使用同样的精确匹配和路径保护；其他受限后台线程仍只读/追加。
     """
     mode = str(args.get("mode") or "").strip().lower()
     if mode not in ("find", "insert", "replace", "delete"):
@@ -871,15 +879,16 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
             ensure_ascii=False,
         )
 
-    # ── 写操作：受限线程（SOP fork / 原生 bg-review）硬拦破坏性 mode ──
-    if mode in ("replace", "delete") and _thread_tool_restricted():
+    # 仅本插件的 SOP 收尾复查获得维护权限，原生 bg-review 等其他受限线程保持原边界。
+    if (mode in ("replace", "delete") and _thread_tool_restricted()
+            and threading.current_thread().name != "kb-sop-fork"):
         return json.dumps({
             "success": False,
             "error": (
-                f"后台收尾线程无权 mode={mode}：它会改到卡里已有正文。"
+                f"此受限后台线程无权 mode={mode}：它会改到卡里已有正文。"
                 "后台只允许 mode=find 与 mode=insert。"
             ),
-            "hint": "要覆盖或删除卡内片段，请由主 AI 在主线程发起。",
+            "hint": "请由主 AI 或本插件的 SOP 收尾复查发起。",
         }, ensure_ascii=False)
 
     paths = _resolve_card_paths(args.get("card_path"))
@@ -1115,12 +1124,11 @@ def delete_reflection_card_handler(args: dict, **kw: Any) -> str:
             failed.append({"path": p, "error": str(e)})
 
     purge = _purge_index_for(removed)
-    residual = 0
-    for v in purge.values():
-        try:
-            residual += max(0, int(v.get("residual_chunks") or 0))
-        except Exception:
-            pass
+    counts = [v.get("residual_chunks", -1) for v in purge.values()]
+    index_clean = bool(purge) and all(
+        v.get("purged") and v.get("residual_chunks") == 0 for v in purge.values()
+    )
+    residual = sum(counts) if all(n >= 0 for n in counts) else -1
     for p in removed:
         _recent_writes.pop(os.path.basename(p), None)
 
@@ -1142,8 +1150,8 @@ def delete_reflection_card_handler(args: dict, **kw: Any) -> str:
     if SOP_RECEIPT_ENABLED and not _in_review_fork_thread():
         _enqueue_receipt_for_kw(f"{SOP_RECEIPT_PREFIX}{receipt}", kw)
     return json.dumps({
-        "success": not failed,
-        "index_clean": residual == 0,
+        "success": not failed and index_clean,
+        "index_clean": index_clean,
         "deleted_files": removed,
         "failed_files": failed,
         "card_title": actual,
@@ -1151,14 +1159,17 @@ def delete_reflection_card_handler(args: dict, **kw: Any) -> str:
         "index_purge": purge,
         "residual_chunks": residual,
         "message": receipt,
-        "note": "硬删不可恢复。索引已显式清理，residual_chunks 应为 0；若 >0 由 watcher 兜底重切。",
+        "note": (
+            "硬删不可恢复。文件及索引已清理，残留切片为 0。" if index_clean else
+            "文件删除已执行，但索引尚未确认清理完成；请检查 index_purge，勿当成全部完成。"
+        ),
     }, ensure_ascii=False)
 
 
 def save_reflection_handler(args: dict, **kw: Any) -> str:
     title = str(args.get("title") or "").strip()
     body = str(args.get("body") or "").strip()
-    kind = str(args.get("kind") or "排障SOP").strip()
+    kind = str(args.get("kind") or "经验").strip()
     tags = args.get("tags") or []
     force = bool(args.get("force"))
 
@@ -1207,23 +1218,10 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
                 "title": title,
                 "candidates": cands,
                 "message": (
-                    f"写卡前查重命中 {len(hits)} 张高分候选（按 rrf 排序，"
-                    f"首名 rrf_score={best.get('rrf_score')}，"
-                    f"rerank 分只用于过 0.85 闸门）。"
-                    "每张候选都带 `title`（卡片 H1）、`section`（命中的小节；**为空表示命中在整卡正文，"
-                    "这张卡没有 ## 小节**）、`snippet`（正文片段）"
-                    "与 `confirm_title`（删卡时逐字填的那个）。"
-                    "**先看 title 判「是不是同一张卡/同一个系统」，再看 section 判「命中在讲哪一块」，"
-                    "最后用 snippet 核细节；不要只看分数，也不要只看 snippet 就下结论。**\n"
-                    "1) 候选中已有同一主题/同一事故、且那张卡**仍然成立** → 不要写新卡，改用 "
-                    "edit_reflection_card(card_path=<candidates[].path>, mode=\"insert\", section_title=..., section_body=...) "
-                    "把本轮新内容追加到那张卡；\n"
-                    "2) 候选卡**本身是错的**（结论被证伪 / 根因写错 / 占位空壳 / 已被更完整的新卡取代）→ "
-                    "**不要 insert 给它续命**（那会让错结论继续被检索到），用 "
-                    "delete_reflection_card(card_path=<path>, confirm_title=<candidates[].confirm_title 逐字>) "
-                    "删掉，再写正确的新卡；\n"
-                    "3) 确认是新主题（只是领域相近、结论不同）→ 再次调用 save_reflection 并带 force=true 写入；\n"
-                    "4) 拿不准 → 不写，并在回复里一句话说明为什么放弃。"
+                    f"查重命中 {len(hits)} 张候选，阈值 {DUP_THRESHOLD}；"
+                    "title 为卡片标题，section 为命中小节，snippet 是片段；"
+                    "confirm_title 为整卡删除确认标题。读原文后判断。\n"
+                    + REFLECTION_CONTENT_POLICY
                 ),
             }, ensure_ascii=False)
         if DRY_RUN:
@@ -1243,8 +1241,7 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
                 "all_hits": hits,
                 "message": (
                     f"知识库已有同题卡（相似度 {best['score']}）：{existing}。"
-                    "请勿重复沉淀 —— 正确做法是在该卡的合适小节追加修正（注明「修正 <日期>」），"
-                    "或确认这是不同主题后带 force=true 重写。"
+                    + REFLECTION_CONTENT_POLICY
                 ),
             }, ensure_ascii=False)
 
@@ -1309,8 +1306,13 @@ def _patch_review_notify_tools() -> None:
         logger.debug("[KBWrite] background_review not importable: %s", e)
         return
     orig = getattr(br, "_collect_review_call_details", None)
-    if orig is None or getattr(orig, "_kbwrite_patched", False):
+    if orig is None:
         return
+    if getattr(orig, "_kbwrite_patched", False):
+        if orig.__globals__ is globals():
+            return
+        import inspect
+        orig = inspect.getclosurevars(orig).nonlocals["orig"]
 
     def _collect(review_messages):
         all_ids, details = orig(review_messages)
@@ -1323,7 +1325,7 @@ def _patch_review_notify_tools() -> None:
                         continue
                     fn = tc.get("function", {}) or {}
                     _tname = fn.get("name")
-                    if _tname not in ("save_reflection", "edit_reflection_card"):
+                    if _tname not in CORE_TOOL_NAMES:
                         continue
                     tcid = tc.get("id")
                     if not tcid:
@@ -1346,7 +1348,10 @@ def _patch_review_notify_tools() -> None:
                             or os.path.basename(str(a.get("card_path") or "")),
                         }
                     else:
-                        details[tcid] = {"tool": "save_reflection", "title": a.get("title", "")}
+                        details[tcid] = {
+                            "tool": _tname,
+                            "title": a.get("title") or a.get("confirm_title", ""),
+                        }
         except Exception:
             logger.debug("[KBWrite] notify whitelist patch failed", exc_info=True)
         return all_ids, details
@@ -1361,9 +1366,13 @@ def _patch_review_notify_tools() -> None:
     # 文案一改回执就静默消失（不报错、工具照常成功）。这里改成按 tool 名直通。
     # 注意：_action_lines 在 background_review.py:761 是同模块直接调用，patch 模块属性生效。
     orig_lines = getattr(br, "_action_lines", None)
+    if (orig_lines is not None and getattr(orig_lines, "_kbwrite_patched", False)
+            and orig_lines.__globals__ is not globals()):
+        import inspect
+        orig_lines = inspect.getclosurevars(orig_lines).nonlocals["orig_lines"]
     if orig_lines is not None and not getattr(orig_lines, "_kbwrite_patched", False):
         def _action_lines(data, detail, verbose):
-            if isinstance(detail, dict) and detail.get("tool") in ("save_reflection", "edit_reflection_card"):
+            if isinstance(detail, dict) and detail.get("tool") in CORE_TOOL_NAMES:
                 msg = data.get("message", "") if isinstance(data, dict) else ""
                 # 形态白名单（2026-10-08）：只放行**真正的写卡回执** —— 以「已」开头
                 # 且长度受限。防的是非回执文本（只读 find 的指引、判重提示等）被当成
@@ -1410,76 +1419,34 @@ def _patch_toolsets_core() -> None:
 # ── 独立 SOP-only fork（与 Hermes 原生 skill/memory review 完全分离） ──────────
 # 原生三个变体（_COMBINED/_SKILL/_MEMORY_REVIEW_PROMPT）只管 memory 与 skills，
 # 本插件不再改它们一个字符；本 fork 只问一件事：本轮该不该沉淀一张 SOP 卡。
-SOP_FORK_PROMPT = """你是一次**只负责反思卡沉淀**的收尾复查（独立于记忆/技能复查，互不干涉）。
-
-判断本轮对话是否产生了具备长期复用价值的技术成果，若有则调用 `save_reflection` 落一张卡；
-若没有，**什么都不要做**，直接结束。
-
-## 该写（命中任一）
-- 排障与根治：定位并根治了系统 / 服务 / 脚本 / 网络的 Bug、Crash、性能卡顿、死锁；
-- 工具与流水线开发：从零搭建或重构了自动化工具、CLI、复合调用流水线；
-- 规约与适配补丁：实装了协议适配、平台差异兜底、配置安全调优、插件层改造。
-
-## 不该写（宁可什么都不写）
-- 查状态、读文件、列目录、纯问答、闲聊；
-- 中途无结论的步骤；已经开始但还没验证成功的尝试。
-
-## 调用方式
-save_reflection(title="...", body="...", kind="排障SOP", tags=["..."])
-
-- `title`：必填，须含核心技术术语与目标对象。禁用「修复了一个 bug」这类空泛标题。
-- `body`：必填，Markdown，必须含四节：
-  1. **触发场景 / 业务背景** —— 什么现象、什么任务引发
-  2. **根本原因与核心设计** —— root cause 与机制，带代码/配置证据
-  3. **标准解决步骤 / CLI使用 / 关键代码** —— 可复现的命令与参数
-  4. **避坑铁律与硬性约束** —— 走死的路、血泪教训
-- `kind`：四选一 —— 排障SOP / 经验 / 工具链路 / 规约SOP
-- `tags`：可选字符串数组
-
-## 硬性要求
-- **严禁占位卡**：任何时候都不要用 `save_reflection` 写「占位 / 登记 / 待填 / 无效」这类空壳卡。
-  那不是「先占个位」，而是**真写进双根、真进索引**的垃圾卡（历史事故：两张标题为「占位」的空卡
-  以 0.86 分进入过「当前执行依据」，事后要双根+索引一起清）。要把内容追加到旧卡却没有路径时，
-  用 `edit_reflection_card(query="…", mode="find")` 拿路径，再用 `mode="insert"` 写。
-- **失败路径最值钱**：正文必须写清「先试了什么、为什么不行、最后怎么成的」。
-  只写成功路径的卡在检索时几乎没用。
-- **查重命中时由你自己判断**：工具会先做语义检索；命中高分候选时返回
-  `action_required="judge_duplicate"` 与 `candidates`（`title`=卡片 H1、`section`=命中的小节、
-  `snippet`=正文片段、分数）。**先看 title 判「是不是同一张卡/同一个系统」，再看 section 判
-  「命中在讲哪一块」，最后用 snippet 核细节；不要只看分数。**
-  ① 卡片仍然成立、只是没覆盖本轮新情况 → **不要写新卡**，改用
-      `edit_reflection_card(card_path=<candidates[].path>, mode="insert", section_title="...", section_body="...")`
-     把本轮的新内容追加到那张卡（会自动带「修正 <日期>：」前缀）；
-     **若你判断库里已有同题卡但这次查重没命中、手上没有路径** → 先调只读工具
-     `edit_reflection_card(query="关键词", mode="find")` 拿候选卡的**绝对路径**，再 insert。
-     **query 必须带「域词」**：本轮事故/成果的**专有名词、主机名、服务名、文件路径、命令、端口、
-     配置键、cron jobid**（如 `thinpool-guard`、`tpool0`、`SNAPGATE`、`restic`、`/etc/tomato`、
-     `50458cb4c0c3`）。**严禁只写抽象模式词**（`哨兵 / 告警 / 推送 / no_agent / cron / watchdog /
-     零输出 / 闸门`）—— 这类词在任何监控类卡上都高分，会把域外卡排到第一（历史事故：用
-     `no_agent cron 哨兵 零输出 告警推送` 去 find，0.9673 命中一张**结算计费**卡，把 thin pool 内容
-     插了进去）。加域词后重查，若第一名换成了真正同域的卡，用那张。
-  ② 候选卡**本身是错的**（结论已被本轮证伪 / 根因写错 / 占位空壳 / 同题重复且已被更完整的卡覆盖）
-     → **不要 insert 给它续命，那只会让错的结论多活一天**。后台线程没有删卡权：**不写卡**，
-     在收尾说明里明确写「建议删除 `<candidates[].path>`（H1：<title>），原因：…」，由主 AI 执行删除。
-  ③ 确为新主题（只是领域相近）→ **再调一次 `save_reflection` 并带 `force=true`** 写入；
-  ④ 拿不准 → 不写，并在收尾说明里写一句理由。**禁止只看分数就放弃。**
-- **insert 前必须核对「主题域」**：读到候选卡后，**先看它的 H1 标题与首段在讲哪个系统/哪件事**，
-  再问「我要插的这段，和这张卡是同一个系统、同一起事故、同一条流水线吗？」
-  - 同一个系统/同一起事故 → 才允许 insert；
-  - **只是「机制相似 / 都是监控 / 都是哨兵」但系统不同（如 LVM 薄池 vs CCH 计费）→ 禁止 insert**，
-    改用 `save_reflection(..., force=true)` 另立新卡（域不同 = 新主题，哪怕机制再像）。
-  - **分数高不等于同域**。0.95+ 只说明「讲的是同类问题」，不说明「讲的是同一个东西」。
-    误插会让两张卡都变脏、检索时互相污染，比多写一张新卡代价大得多。
-- 只做这一件事。不要改记忆、不要改技能。除 `save_reflection` / `edit_reflection_card`
-  （**只允许 mode="find" 与 mode="insert"**）/ 只读工具外，不要调用其他工具。
-- **禁止 `mode="replace"` 与 `mode="delete"`** —— 那会改到卡里已有正文，后台线程没有这个权限（handler 内会被硬拦）。
-"""
+SOP_FORK_PROMPT = (
+    "你负责本轮知识库收尾：判断哪些信息值得记录，以及本轮涉及的已有卡是否需要维护。\n\n"
+    + REFLECTION_CONTENT_POLICY
+    + "\n\n使用 save_reflection 新建，edit_reflection_card 查找/插入/替换/删段，"
+      "delete_reflection_card 删整卡。先读再改删，完成后简要说明实际操作及未完成事项。"
+      "只处理知识库反思卡，不改记忆、技能或其他系统；没有需要处理的内容就结束。"
+)
 
 # 每轮硬触发；置 0 可一键关停（省 token）。
 SOP_FORK_ENABLED = (os.environ.get("KB_WRITE_SOP_FORK") or "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
 SOP_FORK_MAX_ITERS = int(os.environ.get("KB_WRITE_SOP_FORK_MAX_ITERS") or "8")
+
+# ── drain ticket：把 SOP fork 登记进网关的 deferred-worker 表 ──────────────────
+# 每条 fork 自己的 ticket / runner 句柄。fork 一个线程一个，所以用 threading.local 而不是
+# 全局字典：线程退出 local 跟着死，天然没有清理负债。
+_FORK_TICKET = threading.local()
+
+# 置 0 可退回「裸 daemon 线程、drain 不等」的旧语义（排障用，正常别关）。
+SOP_FORK_DRAIN_TICKET = (os.environ.get("KB_WRITE_SOP_FORK_DRAIN_TICKET") or "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# ticket 的软期限（秒）。**必须明显小于 restart_drain_timeout（当前 180s）**：
+# 登记之后 drain 会真的等 fork，若 fork 卡在上游超时上，会把整次重启拖满 180s 才硬杀。
+# 到期限就主动让 drain 放行（fork 本体继续跑，被 os._exit 掐掉 —— 即回退到旧行为），
+# 用「可能丢一张卡」换「重启不会被一张卡绑架」。
+SOP_FORK_DRAIN_BUDGET = float(os.environ.get("KB_WRITE_SOP_FORK_DRAIN_BUDGET") or "45")
 
 # 回执里标题的最大显示长度；超出则截断加省略号（群聊防刷屏，可调）。
 RECEIPT_TITLE_MAX = int(os.environ.get("KB_WRITE_RECEIPT_TITLE_MAX") or "48")
@@ -1710,12 +1677,85 @@ def _drain_pending_receipts(agent: Any) -> None:
                 cb(msg)
 
 
+def _open_drain_ticket(fork_agent: Any) -> None:
+    """把本线程的 SOP fork 登记进网关自己的 deferred-worker 表。
+
+    网关 drain 只等四类活儿：`_running_agents` / cron / api_server / `_deferred_agent_workers`
+    （`gateway/run_shutdown.py:805`）。SOP fork 是裸 daemon 线程，四类都不算 —— 于是
+    `finalize_turn` 一返回、主回合归零，drain 立刻放行，`os._exit` 把 fork 直接掐掉
+    （`gateway/run.py:5154` 注释写明 os._exit 绕开所有 join）。
+
+    登记之后语义就对了：
+      - drain 会真的等它（上限 `restart_drain_timeout`，是天花板不是必等时长）；
+      - 超时路径下调 `_interrupt_deferred_agent_workers` 会对 fork_agent 下 hard_interrupt，
+        fork 提前收手而不是被无声杀掉。
+
+    用 ``concurrent.futures.Future`` 而不是 asyncio.Future：本函数跑在 fork 线程里，
+    没有 running loop；concurrent 的 Future 线程安全、`done()/cancelled()/exception()/
+    add_done_callback()` 与网关那边的鸭子类型完全兼容，不需要 call_soon_threadsafe。
+    """
+    if not SOP_FORK_DRAIN_TICKET:
+        return
+    try:
+        # 只在网关进程里生效：优先从已装载的模块取 runner 弱引用，绝不在 CLI/cron 里
+        # 为了一个探针去 import 整个 gateway.run。
+        mod = sys.modules.get("gateway.run")
+        if mod is None:
+            return
+        ref = getattr(mod, "_gateway_runner_ref", None)
+        runner = ref() if callable(ref) else None
+        if runner is None:
+            return
+        track = getattr(runner, "_track_deferred_agent_worker", None)
+        if not callable(track):
+            return
+        import concurrent.futures as _cf
+        fut: Any = _cf.Future()
+        track(fut, fork_agent)
+        _FORK_TICKET.future = fut
+        # 软期限：到点主动 set_result，让 drain 放行。fork 本体会继续跑（daemon 线程），
+        # 进程若在这之后被 os._exit，就回退成旧行为 —— 晚一步丢的是一张卡，不是一次重启。
+        budget = SOP_FORK_DRAIN_BUDGET
+        if budget > 0:
+            watchdog = threading.Timer(budget, _release_ticket, args=(fut,))
+            watchdog.daemon = True
+            watchdog.name = "kb-sop-fork-ticket"
+            _FORK_TICKET.watchdog = watchdog
+            watchdog.start()
+        logger.debug(
+            "[KBWrite] sop fork registered as deferred worker (drain will wait, budget=%.0fs)", budget,
+        )
+    except Exception as e:  # 登记失败绝不影响 fork 本体 —— 退化成原来的 daemon 语义
+        logger.debug("[KBWrite] sop fork drain ticket skipped: %s", e)
+
+
+def _release_ticket(fut: Any) -> None:
+    """幂等地让某张 ticket 放行 drain。soft 期限与正常收尾都走这里，避免两处口径分叉。"""
+    with suppress(Exception):
+        if not fut.done():
+            fut.set_result(None)
+
+
+def _close_drain_ticket() -> None:
+    """注销本线程的 drain ticket。必须在 fork 收尾的 finally 里调，否则 drain 会白等一下。"""
+    fut = getattr(_FORK_TICKET, "future", None)
+    if fut is None:
+        return
+    _FORK_TICKET.future = None
+    watchdog = getattr(_FORK_TICKET, "watchdog", None)
+    _FORK_TICKET.watchdog = None
+    if watchdog is not None:
+        with suppress(Exception):
+            watchdog.cancel()  # 正常收尾了就撤掉软期限，别留个空跑的 timer 线程
+    _release_ticket(fut)
+
+
 def _sop_fork_worker(agent: Any, messages_snapshot: list) -> None:
     """独立 SOP fork 的线程体（复刻原生 review 的四段仪式，但只跑 SOP 提示词）。
 
     与原生 fork 的隔离点：
       - 自己的 prompt（``SOP_FORK_PROMPT``），不碰原生三个变体一个字符；
-      - 自己的工具白名单：只放 ``save_reflection``（外加只读 read_file/search_files）；
+      - 自己的工具白名单：三条反思卡工具，外加只读 read_file/search_files；
       - 自己的线程（``kb-sop-fork``），不占 parent 的 ``_background_review_run`` token，
         不会把原生 review 挤掉，也不会被它的 finish 误关。
     """
@@ -1738,25 +1778,21 @@ def _sop_fork_worker(agent: Any, messages_snapshot: list) -> None:
             agent, None, max_iterations=SOP_FORK_MAX_ITERS, write_origin="background_review",
         )
         review_agent._review_attended = False
+        # 登记进网关的 deferred-worker 表 —— 必须在 run_conversation 之前，
+        # 否则 drain 可能已经放行。build 阶段不发模型请求，这个窗口足够小。
+        _open_drain_ticket(review_agent)
         set_thread_tool_whitelist(
-            {"save_reflection", "edit_reflection_card",
+            {"save_reflection", "edit_reflection_card", "delete_reflection_card",
              "read_file", "search_files"},
             deny_msg_fmt=(
-                "SOP fork denied non-whitelisted tool: {tool_name}. This fork only writes, "
-                "appends or looks up reflection cards via save_reflection / "
-                "edit_reflection_card (mode=find|insert only; replace/delete are "
-                "hard-blocked inside the handler). Do not retry {tool_name}."
+                "SOP fork denied non-whitelisted tool: {tool_name}. "
+                "Only reflection card tools and read_file/search_files are allowed. "
+                "Do not retry {tool_name}."
             ),
         )
         with thread_scoped_silence():
             review_agent.run_conversation(
-                user_message=(
-                    SOP_FORK_PROMPT
-                    + "\n\nYou can only call save_reflection / edit_reflection_card "
-                    "(mode=find or insert ONLY; replace/delete are hard-blocked) "
-                    "(plus read_file/search_files). Other tools will be "
-                    "denied at runtime — do not attempt them."
-                ),
+                user_message=SOP_FORK_PROMPT,
                 conversation_history=(
                     br._digest_history(messages_snapshot) if _routed else messages_snapshot
                 ),
@@ -1779,6 +1815,8 @@ def _sop_fork_worker(agent: Any, messages_snapshot: list) -> None:
     except Exception as e:
         logger.warning("[KBWrite] sop fork failed: %s", e)
     finally:
+        # 先注销 ticket 再做收尾：让 drain 尽早放行，别把 usage 归属/客户端释放也算进等待窗口。
+        _close_drain_ticket()
         with suppress(Exception):
             clear_thread_tool_whitelist()
         with suppress(Exception):
@@ -1789,6 +1827,80 @@ def _sop_fork_worker(agent: Any, messages_snapshot: list) -> None:
                 br._record_review_usage_to_parent(agent, br._snapshot_review_usage(review_agent))
             with suppress(Exception):
                 br._release_fork_clients(review_agent)
+
+
+def _has_successful_work_tool_call(messages) -> bool:
+    """Only review turns that completed a non-retrieval tool successfully.
+
+    This is a code-level cost gate: the review model must not be started merely to
+    decide whether the turn contained anything worth recording.
+    """
+    if not isinstance(messages, list):
+        return False
+
+    # ``messages`` is the conversation snapshot, not necessarily this turn alone.
+    # Old tool calls must never authorize a review for a later plain-chat turn.
+    current_turn_start = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if isinstance(messages[index], dict) and messages[index].get("role") == "user"),
+        None,
+    )
+    if current_turn_start is None:
+        return False
+    messages = messages[current_turn_start:]
+
+    read_only_tools = {
+        "read_file", "search_files", "web_search", "web_extract",
+        "hindsight_recall", "hindsight_reflect", "search_knowledge",
+        "skill_view", "tool_search", "tool_describe",
+    }
+    calls = {}
+    results = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or ():
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                function = call.get("function") or {}
+                name = function.get("name") if isinstance(function, dict) else None
+                if call_id and name:
+                    calls[call_id] = name
+        elif message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if call_id:
+                results[call_id] = message
+
+    if not calls or not results:
+        return False
+
+    try:
+        from agent.display import _detect_tool_failure
+    except Exception:
+        # Fail closed: if Hermes' canonical result classifier is unavailable,
+        # don't spend a model call on an unverified tool outcome.
+        return False
+
+    for call_id, name in calls.items():
+        if name in read_only_tools:
+            continue
+        result = results.get(call_id)
+        if result is None:
+            continue
+        content = result.get("content")
+        if isinstance(content, str):
+            # KB menus can follow an otherwise valid JSON result. Classify the
+            # structured payload, not the presentation suffix added by plugins.
+            with suppress(ValueError):
+                payload, end = json.JSONDecoder().raw_decode(content.lstrip())
+                if isinstance(payload, dict):
+                    content = payload
+        failed, _ = _detect_tool_failure(name, content)
+        if not failed:
+            return True
+    return False
 
 
 def _patch_sop_fork() -> None:
@@ -1817,9 +1929,13 @@ def _patch_sop_fork() -> None:
     if orig is None:
         logger.warning("[KBWrite] finalize_turn missing; SOP fork not installed")
         return
+    previous = orig
     if getattr(orig, "_kbwrite_sop_fork", False):
-        logger.info("[KBWrite] SOP fork already installed (no-op)")
-        return
+        # 热重载不能复用捕获旧模块全局变量的 wrapper，否则后台仍用旧提示和白名单。
+        if orig.__globals__ is globals():
+            logger.info("[KBWrite] SOP fork already installed (no-op)")
+            return
+        orig = orig.__wrapped__
 
     import functools
     import threading
@@ -1849,6 +1965,13 @@ def _patch_sop_fork() -> None:
                 and not kwargs.get("failed")
                 and not getattr(agent, "skip_background_review", False)
             ):
+                eligible = _has_successful_work_tool_call(snapshot)
+                logger.info(
+                    "[KBWrite] sop fork gate=%s pid=%s session=%s",
+                    "run" if eligible else "skip", os.getpid(), getattr(agent, "session_id", None),
+                )
+                if not eligible:
+                    return result
                 # 上下文传播挂在线程 target 上（对齐原生 bg-review 的做法）。
                 # 绝不能套在这层 wrapper 外面：propagate_context_to_thread 的 _runner
                 # 是裸 *args/**kwargs 且未用 functools.wraps，会让调用方的
@@ -1871,7 +1994,7 @@ def _patch_sop_fork() -> None:
     targets = ["agent.turn_finalizer"]
     try:
         from agent import conversation_loop as cl
-        if getattr(cl, "finalize_turn", None) is orig:
+        if getattr(cl, "finalize_turn", None) is previous:
             cl.finalize_turn = finalize_turn_with_sop_fork
             targets.append("agent.conversation_loop")
     except Exception as e:
@@ -1879,33 +2002,7 @@ def _patch_sop_fork() -> None:
     logger.info("[KBWrite] installed independent SOP-only fork on finalize_turn (%s)", ", ".join(targets))
 
 
-REFLECTION_RULES = """## 收尾反思（save_reflection）
-
-每轮任务收尾时自检一次：本轮是否产生了具备长期复用价值的技术成果？若有，调用 `save_reflection` 沉淀一张反思卡。
-
-该调用（命中任一即可）：
-- 排障与根治：定位并根治了系统 / 服务 / 脚本 / 网络的 Bug、Crash、性能卡顿、死锁；
-- 工具与流水线开发：从零搭建或重构了自动化工具、CLI、复合调用流水线；
-- 规约与适配补丁：实装了协议适配、平台差异兜底、配置安全调优、插件层改造。
-
-不该调用（宁可什么都不写）：
-- 查状态、读文件、列目录、纯问答、闲聊；
-- 中途无结论的步骤；已经开始但还没验证成功的尝试。
-
-硬性要求：
-- **查重命中时由你判断（不替你下结论）**：`save_reflection` 返回 `action_required=judge_duplicate` 时会给 `candidates`，每条含 `title`（卡片 H1）、`section`（命中在哪个小节）、`snippet`（正文片段）、`confirm_title`（删卡要逐字填的那个）、分数。**先看 title 判是否同一张卡/同一系统，再看 section 判命中讲哪块，最后用 snippet 核细节——不要只看分数。**判断出口：① 卡仍然成立、只是没覆盖本轮新情况 → **不要写新卡**，用 `edit_reflection_card(card_path, mode="insert", section_title, section_body)` 插到那张卡（默认插末尾；给了 `after` 锚点可插到卡内任意位置）；② 卡本身是错的 → **别 insert 续命，直接删**（见下一条）；③ 确为新主题 → 带 `force=true` 重写；④ 拿不准 → 不写并说明理由。
-- **严禁占位卡 / 拿路径用 edit_reflection_card(mode="find")**：不要用 `save_reflection` 写「占位 / 登记 / 待填 / 无效」这类空壳卡（会真写进双根与索引，污染检索）。要把内容追加到旧卡但没有路径时，用 `edit_reflection_card(query="关键词", mode="find")` 拿候选卡的绝对路径（只读，不发回执），再用 `mode="insert"` 写。
-- **有问题的卡就该删，别用 insert 给它续命**：`delete_reflection_card` 是正常维护动作，不是「最后手段」。命中候选里出现以下任一情况 → **直接删**，然后在同一张正确的新卡上重新沉淀：
-  · 结论已被本轮证伪（老卡说的做法现在会坏事）；
-  · 根因写错、会把人带偏（比「没这张卡」危害更大）；
-  · 占位卡 / 空壳卡 / 只有标题没有实证的卡；
-  · 同题重复卡：内容已被更完整的那张覆盖，留着只会互相污染检索；
-  · 卡里指的路径 / 命令 / 配置键 / 服务名已不存在，且没有历史教训价值。
-  **什么情况才不该删**：卡是对的、只是没覆盖本轮新情况 → 用 `mode="insert"` 追加修正节（这是首选）；卡片个别字句错、主体仍成立 → `mode="replace"`；拿不准该不该删 → 先 `edit_reflection_card(query="…", mode="find")` 看全文，仍然拿不准就不删、并说明理由。
-- **删卡三步，缺一不可**：① `edit_reflection_card(query="域词", mode="find")` 确认目标卡（看 H1 与首段，确认是同一个系统/同一起事故）；② `delete_reflection_card(card_path=<该卡 path>, confirm_title=<该卡 H1 逐字，标题分类前缀如「[排障SOP] 」也要带上>)`；③ 删完可写正确的新卡，或把「删了哪张、为什么」一句话回给用户。**硬删不可恢复，没有回收站**，所以 confirm_title 必须逐字，不要自己重排/简写标题。
-- **失败路径最值钱**：正文必须写清「先试了什么、为什么不行、最后怎么成的」。只写成功路径的卡在检索时几乎没用。
-- 标题必须含核心技术术语与目标对象，禁用「修复了一个 bug」这类空泛标题。
-"""
+REFLECTION_RULES = "## 知识库记录与维护\n\n" + REFLECTION_CONTENT_POLICY
 
 
 def register(ctx: Any) -> None:
@@ -1929,12 +2026,10 @@ def register(ctx: Any) -> None:
         schema=SAVE_REFLECTION_SCHEMA,
         handler=save_reflection_handler,
         check_fn=lambda: True,
-        description="沉淀本轮的技术反思卡到知识库（写前自动查重；命中候选项时由你读片段判断是否同题）",
-        emoji="📥",
+        description="记录值得复用的知识（自由组织正文，写前自动查重）",
+        emoji=TOOL_EMOJI["save_reflection"],
     )
-    # 改 / 删（2026-10-07 owner 指令）。fork 白名单只放 save_reflection 与 edit_reflection_card；
-    # edit 的 mode=replace/delete 在 **handler 内部**硬拦 —— 因为 hermes_cli 的白名单只按工具名拦，
-    # 不解析 mode，放进白名单 ≠ 安全。delete_reflection_card 绝不进白名单。
+    # 主线程与 SOP 收尾复查共用三条工具及精确匹配、路径、标题保护。
     ctx.register_tool(
         name="edit_reflection_card",
         toolset="memory",
@@ -1943,7 +2038,7 @@ def register(ctx: Any) -> None:
         check_fn=lambda: True,
         description=("修改已有反思卡：mode=find 只读找卡 / insert 插入小节 / "
                      "replace 精确覆盖 / delete 删掉片段（双根同步）"),
-        emoji="🖊️",
+        emoji=TOOL_EMOJI["edit_reflection_card"],
     )
     ctx.register_tool(
         name="delete_reflection_card",
@@ -1952,17 +2047,15 @@ def register(ctx: Any) -> None:
         handler=delete_reflection_card_handler,
         check_fn=lambda: True,
         description="硬删除一张反思卡（双根 + 索引一起清，不可恢复；confirm_title 须逐字等于 H1）",
-        emoji="🗑️",
+        emoji=TOOL_EMOJI["delete_reflection_card"],
     )
     logger.info(
         "[KBWrite] registered save_reflection (dedup_threshold=%s, rerank_top_n=%s, dry_run=%s, "
         "judge_mode=%s, snippet_chars=%s)",
         DUP_THRESHOLD, DUP_RERANK_TOP_N, DRY_RUN, JUDGE_MODE, DUP_SNIPPET_CHARS,
     )
-    logger.info("[KBWrite] registered edit_reflection_card (4-in-1: find/insert/replace/delete; "
-                "whitelisted for SOP fork but replace/delete hard-blocked in-handler)")
-    logger.info("[KBWrite] registered delete_reflection_card "
-                "(main-AI only; deliberately NOT whitelisted for SOP fork)")
+    logger.info("[KBWrite] registered reflection maintenance tools for main AI and SOP fork "
+                "(find/insert/replace/delete; free-form content, guarded card deletion)")
     # 装载留痕：`plugin_health_watchdog.py` 的「改动是否已装载」判据 grep 的就是
     # `code md5=` + 插件名 + 时间戳这一行（热重载不改变进程启动时间，只能靠它翻案）。
     # 本插件早先没有这行，于是每次改完必定被判「改动未装载，需 reload」——

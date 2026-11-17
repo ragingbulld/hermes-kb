@@ -8,7 +8,7 @@ handler 只有十几行 —— 它**不自己检索**，只把 query 丢给 `plu
 from typing import Any
 
 from .plugin_class import plugin_instance
-from .plugin_common import _short
+from .plugin_common import QUERY_WRITING_GUIDE, QUERY_WRITING_EXAMPLES, _short
 
 SEARCH_KB_SCHEMA = {
     "name": "search_knowledge",
@@ -23,11 +23,7 @@ SEARCH_KB_SCHEMA = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": (
-                    "三段式，用 ｜ 隔开：`病灶现象｜目标对象｜专名`。"
-                    "例：`URLs (0个) 未找到可用的下载链接｜traffic-consumer 容器｜--auto-remove-failed-url Config.Cmd`。"
-                    "抄你眼睛看见的报错原文/字段名/路径/版本号；别写动作词（排查、修复、优化）和评价词。"
-                ),
+                "description": QUERY_WRITING_GUIDE + "\n" + QUERY_WRITING_EXAMPLES,
             },
             "limit": {
                 "type": "integer",
@@ -50,7 +46,7 @@ def search_knowledge_handler(args: dict[str, Any], **kw: Any) -> str:
     """
     query = str(args.get("query", "")).strip()
     if not query:
-        return "search_knowledge 需要 `query`：三段式 `病灶现象｜目标对象｜专名`。"
+        return "search_knowledge 需要非空 `query`。\n" + QUERY_WRITING_GUIDE
     limit = max(1, min(int(args.get("limit", 3) or 3), 10))
     body = plugin_instance._inline_menu(query, max_cards=limit)
     if body:
@@ -58,5 +54,6 @@ def search_knowledge_handler(args: dict[str, Any], **kw: Any) -> str:
     return (
         f"<knowledge-base-note>「{_short(query, 60)}」没捞到新卡"
         "（要么过了重排闸门的一张都没有，要么这些卡本轮清单里已经给过了）。"
-        "换词重试：抄你眼睛看见的报错原文/字段名/路径，别用评价词。</knowledge-base-note>"
+        "先看本轮已有清单；需要细化时补入对话已明确的对象、现象或新取得的字段，"
+        "不要猜根因、错误码或卡名。</knowledge-base-note>"
     )

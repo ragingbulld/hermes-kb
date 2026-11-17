@@ -85,23 +85,30 @@ class MarkdownChunker:
                 if not self._is_heading_only(sub_text)
             ]
             for sub_idx, sub_text in enumerate(sub_chunks):
-                sub_path = sec["heading_path"]
-                if len(sub_chunks) > 1:
-                    sub_path = f"{sub_path} (Part {sub_idx + 1})"
+                # `(Part N)` 不再拼进 heading_path：那是**位置**不是章节名。
+                # 拼进去的后果：同一节被切成 16 片就成了 16 个不同「标题」，
+                # 清单里长出一串「…（Part 2..16）」，卷进向量文本还稀释语义。
+                # 归属用 heading_path 表达，第几片用 part_index 表达，两者不混。
                 bounded_sections.append({
-                    "heading_path": sub_path,
+                    "heading_path": sec["heading_path"],
+                    "part_index": sub_idx + 1 if len(sub_chunks) > 1 else 0,
                     "content": sub_text,
                 })
 
         # Pack adjacent short sections toward target_chars without crossing
-        # max_chars. Keeping the first heading path is intentional: subsequent
-        # heading lines remain in content and are still searchable by FTS.
+        # max_chars. 合并只在**同一标题路径**内进行：早先只要前一块没到
+        # target_chars 就并进后一块，但 heading_path 只留前一块的，于是后半段
+        # 正文挂在上一节名下（实测最坏一整节 325 行都算到前一个伪标题头上）。
+        # 短节宁可留着短，也不许改变它归属哪一节。
         packed = []
         for sec in bounded_sections:
             if not packed:
                 packed.append(dict(sec))
                 continue
             previous = packed[-1]
+            if previous["heading_path"] != sec["heading_path"]:
+                packed.append(dict(sec))
+                continue
             combined = f"{previous['content']}\n\n{sec['content']}"
             should_merge = (
                 len(previous["content"]) < self.target_chars
@@ -109,13 +116,18 @@ class MarkdownChunker:
             )
             if should_merge and len(combined) <= self.max_chars:
                 previous["content"] = combined
+                # 合并后这一块含多片，再标「第几片」就不成立了。
+                previous["part_index"] = 0
             else:
                 packed.append(dict(sec))
 
         final_chunks = []
         for idx, sec in enumerate(packed):
             final_chunks.append(
-                self._make_chunk(file_path, sec["heading_path"], sec["content"], idx)
+                self._make_chunk(
+                    file_path, sec["heading_path"], sec["content"], idx,
+                    sec.get("part_index") or 0,
+                )
             )
         return final_chunks
 
@@ -133,7 +145,7 @@ class MarkdownChunker:
                 crumbs.append(value)
         return " > ".join(crumbs) if crumbs else "知识库文档"
 
-    def _make_chunk(self, file_path, heading_path, content, index):
+    def _make_chunk(self, file_path, heading_path, content, index, part_index=0):
         vector_text = f"【路径】{heading_path}\n\n{content}"
         chunk_id = hashlib.md5(
             f"{file_path}::{index}::{content[:50]}".encode("utf-8")
@@ -142,6 +154,9 @@ class MarkdownChunker:
             "chunk_id": chunk_id,
             "file_path": file_path,
             "heading_path": heading_path,
+            # 同一节被切成多片时的序号（1 起），整节一块则为 0。
+            # 它是「位置」不是章节名：不进 heading_path，也不进向量文本。
+            "part_index": int(part_index or 0),
             "content": content,
             "vector_text": vector_text,
             "char_count": len(content),

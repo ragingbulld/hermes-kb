@@ -8,6 +8,7 @@
 
 from .plugin_common import (
     KB_FIELD,
+    KB_QUERY_DESCRIPTION,
     _EXEMPT_TOOLS,
     _NO_KB_FIELD,
     _STRIP_KEYS,
@@ -87,26 +88,7 @@ def _install_schema_guard() -> None:
                 new_properties = {
                     KB_FIELD: {
                         "type": "string",
-                        "description": (
-                            "检索词。只干一件事：把知识库里那张对的卡捞出来。"
-                            "**不是任务描述，也不是「我要做什么」。**\n"
-                            "写「现在发生了什么」，抄你已经看见的字面 —— "
-                            "报错原文、字段名、参数名、路径、容器名、命令、版本号，"
-                            "原样抄，大小写和 `-` `_` `.` 一个都别改。\n"
-                            "来源只认四处：用户这番话里的产品名/文件名/报错、"
-                            "工具调用参数、工具返回值、本轮读到的文件。\n"
-                            "例：用户说「去掉自动移除」→ 写 "
-                            "`--auto-remove-failed-url Config.Cmd`；"
-                            "用户说「计费对不上」→ 写 "
-                            "`usage_ledger attempts=0 unmatched`。\n"
-                            "**抄之前先自问：这个词可能出现在某张卡的标题或正文里吗？** "
-                            "答不上来就别写 —— 本轮刚生成的临时文件名（`a1.jpg`）、"
-                            "临时变量、本地路径片段，库里永远不会有，写了等于空转。\n"
-                            "也别只写意图：`继续排查检查确认` 这种写完等于没写，"
-                            "意图永远只有那几个词，现象才带信息。\n"
-                            "**你还没看见任何字面就想写检索词，说明该先去看，不是先去检索。**\n"
-                            "每次工具调用都要写；空串 / none / null / 无 会被打回。"
-                        ),
+                        "description": KB_QUERY_DESCRIPTION,
                     },
                 }
                 new_properties.update(
@@ -177,13 +159,7 @@ def _install_schema_guard() -> None:
                     )
                     return tool_error(
                         f"[kb_query 必填] 工具 `{_eff}` 没写 `kb_query`。\n"
-                        "每一次工具调用都要写它，值是「你已经看见过的原文」里的专名，"
-                        "三段式：`病灶现象｜目标对象｜专名`。\n"
-                        "**每一条都必须是真的检索词** —— 没有「这条跳过」的写法，"
-                        "`none` / `null` / 空串 / `无` 都会被打回。\n"
-                        "抄这条调用自己的参数当检索词：要执行什么，那个名字就是它。\n"
-                        "要上一次清单里的正文，直接 `read_file` 那个路径"
-                        "（`read_file` 同样要带 kb_query —— 门禁不看工具类型）。\n"
+                        f"{KB_QUERY_DESCRIPTION}\n"
                         "经 tool_call 桥调用时写在 calls[].arguments 内层。",
                         error_type="kb_query_missing",
                         tool=_eff,
@@ -201,16 +177,7 @@ def _install_schema_guard() -> None:
                 return tool_error(
                     f"[kb_query 不可用] 工具 `{_eff}` 的 `kb_query` 必须填真实检索词"
                     f"（现在收到 {_raw!r}）。\n"
-                    "怎么填：写「现在发生了什么」+ 抄你眼睛已经看见的字面"
-                    "（报错原文/字段名/参数名/路径/容器名/命令/版本号），原样抄别改大小写。\n"
-                    "· terminal(command=\"systemctl restart daed\") → `daed systemctl restart`\n"
-                    "· read_file(path=\".../xxx/__init__.py\") → `xxx __init__.py`\n"
-                    "· 报错原文 bpf_redirect_peer → `bpf_redirect_peer`\n"
-                    "只写「继续/排查/检查/确认」这类意图等于没写（意图永远就那几个词，"
-                    "现象才带信息）；但带信息的动词要留，别机械删词。\n"
-                    "本轮刚生成的临时文件名（a1.jpg）、临时变量、本地路径片段别写 —— "
-                    "库里永远不会有，写了等于空转。\n"
-                    "弃权写法（none / null / 空串 / 无）不算填了 —— 每一条调用都要真检索。",
+                    f"{KB_QUERY_DESCRIPTION}",
                     error_type="kb_query_unusable",
                     tool=_eff,
                 )
