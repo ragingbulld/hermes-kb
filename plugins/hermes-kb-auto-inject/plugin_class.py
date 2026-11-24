@@ -28,11 +28,15 @@ from .plugin_common import (
     scan_heads,
 )
 
-# kb_query 的检索**一律异步**：提交进池子，由 `handle_llm_request` 在
-# 下一次模型请求的尾部注入。这里不再有「哪些工具必须同步」的名单 ——
-# 曾经有（terminal / write_file / patch…），它造出了第二条注入路径和
-# 第二套去重账，两个入口对「同一个词查过没有」各记各的账，互相看不见。
-# 现在只剩一个提交口 `kb_queue`、一个注入口 `handle_llm_request`。
+# 检索**一律异步**，出口只有一条：检索跑完把清单攒进待投递槽（`_on_job_done`），
+# 下一次模型请求前由 `llm_request` 中间件贴到最后一条消息尾部（`handle_llm_request`）。
+# 中间件改的是核心 `_safe_copy` 出来的请求副本，**只在这一次调用里生效、不落 state.db** ——
+# 这是 owner 2026-11-24 定案「不进上下文历史」的唯一正确落点。
+# 曾经有过的通道：直写会话历史（进历史、下一轮反复重放）、`transform_tool_result`
+# （要等下一次工具返回）、轮首有界等待（把首字拖慢 2.5s）。都删了，别再长回来。
+#
+# **没有去重账**（2026-11-24 晚 owner 定案）：不记已印过的卡、不扫历史比对、不按词查重。
+# 检索到几块就印几块，重复就重复 —— 少一份账本就少一处会漂的状态。
 
 
 # heading_path 的层级怎么拆，规则只有一份：`hermes_kb/heading.py`。
@@ -73,21 +77,17 @@ class KBAutoInjectPlugin:
         # 协议段「每 turn 只发一次」的记账 —— 本插件唯一保留的 turn 状态。
         self._turns: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._max_turn_states = 128
-        # ---------------- 全部状态：本轮印过的卡 + 已印落点 ----------------
-        # card_key -> {"no": 序号, "hits": 已印过的落点集合}。不存正文：正文一律由
-        # read_file 取，插件不再持有任何一块原文 —— 存了也只服务一个已删掉的展开工具。
-        # 键一旦入册序号就定死（同一张卡永远同一个 #N），已发出去的号永不重排。
-        # 落点按 (完整标题链, 起行, 行数) 记账 —— 去重的尺度是落点，不是整张卡。
-        self._shown: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        # 同一轮里同一个检索词只检索一次：模型一批里两个调用写同一个 kb_query，
-        # 就会检索两遍、贴两份清单（实测 20261023_225015_ea5c533c）。
-        self._served_query = ""
-        # 没有「已注入」账本、也没有跨轮状态：池子每 turn 清空，
-        # 上面三个字段就是全部。热重载清零也不影响（从空态自洽起步）。
-        #
-        # kb_query 的后台检索池：只跑 retrieve（慢的网络段），产物是裸 chunks。
-        # 印刷与去重全在主线程做，所以上面三个字段仍然只有主线程写 —— 无竞态。
-        self._async_pool = KBAsyncPool(self.retrieve_chunk)
+        # ---------------- 全部状态：一次待投递的清单 ----------------
+        # sid -> [清单文本, ...]。检索跑完由后台线程 `_on_job_done` 追加，
+        # 下一次模型请求前由 `handle_llm_request` **一次取空**。
+        # 不记「印过哪张卡」、不扫历史比对、不按词查重 —— 去重整套删掉了（owner 2026-11-24 定案）。
+        self._pending: Dict[str, List[str]] = {}
+        self._pending_lock = threading.Lock()
+        # kb_query 的后台检索池：只跑 retrieve（慢的网络段）。**跑完当场回调**
+        # `_on_job_done` 把清单塞进待投递槽 —— 池子里没有「等人来取」的成品。
+        self._async_pool = KBAsyncPool(
+            self.retrieve_chunk, on_done=self._on_job_done
+        )
 
     @property
     def engine(self) -> Any:
@@ -148,9 +148,10 @@ class KBAutoInjectPlugin:
                 self._turns.popitem(last=False)
             return state
 
-    # ============ 一步，全在当场：kb_query → 标题清单（带行号）============
+    # ============ 两步：kb_query → 后台池 → 标题清单（带行号）============
     #
-    # 每一次工具调用都带 kb_query → 清单当场贴回这条工具结果（序号只增不变）。
+    # 每一次工具调用都带 kb_query → 检索丢进后台池；清单渲染好排进待投递槽，
+    # 下一次模型请求由 `llm_request` 中间件贴进请求副本尾部（改副本，不落 state.db）。
     # 清单里每行都写着 `read_file` 现成的路径 + 命中段行号，要正文模型自己去读。
     # 插件到此为止，不再持有原文、也没有第二个工具。
 
@@ -444,7 +445,7 @@ class KBAutoInjectPlugin:
         砍掉中间层。实测"完整链"根本不贵：去掉 H1 之后全长**中位 44 字、P90 108 字**，
         超过 120 字的只有 6.7%，所以没有理由为省几十字牺牲可理解性 —— 全印。
 
-        H1 不重复印（它已经在 `#N` 标题行上）。`(Part 1)` 是切分母出来的，剥掉，
+        H1 不重复印（它已经在卡片首行的标题里）。`(Part 1)` 是切分母出来的，剥掉，
         否则同一节看着像三节。通用小节名（「根本原因与核心设计」）在完整链里是结构
         信息，**保留**，不再像只印一级时那样过滤掉。
 
@@ -555,7 +556,7 @@ class KBAutoInjectPlugin:
         return spans
 
     def _render_menu(self, menu: List[Dict[str, Any]], query: str = "") -> str:
-        """标题清单：序号 + 卡标题 + 命中小节 + **可直接喂给 `read_file` 的行号**。
+        """标题清单：卡标题 + 命中小节 + **可直接喂给 `read_file` 的行号**。
 
         刻意不印 gate 分（全挤在 0.99xx，纯噪音）、不印 chunk_id（4 位前缀 36.42% 碰撞）。
 
@@ -566,8 +567,8 @@ class KBAutoInjectPlugin:
         那需要 `_chain_spans` / `_outline`。原先只有 `_chain_spans` 被外部算好
         传进来，所以还能是静态的；现在树的形状由命中集合决定，行范围得在里面现算。
 
-        序号不在这里发：`#N` 是**跨屏地址**，由 `_inline_menu` 记账时定死
-        （同一张卡永远同一个号），渲染层只负责照 `m["no"]` 印。
+        **不印序号**：`#N` 是去重账本的产物（同一张卡永远同一个号），账本删了，
+        序号也就没有意义 —— 认卡靠标题和路径。
         """
         _chain_spans = self._chain_spans
 
@@ -681,13 +682,12 @@ class KBAutoInjectPlugin:
             walk(root, "   ", [])
             return ("\n" + "\n".join(out)) if out else ""
 
-        def _row(i: int, m: Dict[str, Any]) -> str:
-            # 序号由记账层（_inline_menu）给，同一张卡永远同一个号；直接拿未编号的
-            # 菜单来渲染时（离线验证脚本）就地按顺序编，不留 `#0` 这种假地址。
-            no = m.get("no") or i
-            # 大标题行 = 这张卡的身份 + 整卡体量。体量决定「整篇读还是只读一段」，
+        def _row(m: Dict[str, Any]) -> str:
+            # 卡标题行 = 这张卡的身份 + 整卡体量。体量决定「整篇读还是只读一段」，
             # 是卡的属性，就该跟卡标题在一起。
-            out = f"#{no} {m['title']}"
+            # 不再印 `#N`：序号本来就是去重账本的产物（同一张卡永远同一个号），
+            # 账本删了，序号也就没有意义 —— 认卡靠标题和路径。
+            out = m["title"]
             total = int(m.get("total") or 0)
             tl = int(m.get("total_lines") or 0)
             cs = int(m.get("card_start") or 1) or 1
@@ -713,7 +713,7 @@ class KBAutoInjectPlugin:
                 out += f"\n   └ 路径：{m['path']}"
             return out
 
-        lines = "\n".join(_row(i, m) for i, m in enumerate(menu, 1))
+        lines = "\n".join(_row(m) for m in menu)
         # 抬头报**卡数**：每行一张卡（老卡有新落点时重印的仍是同一张卡，不会重复计数）。
         # 检索词印在自己这一屏的抬头里：多词合并时每屏各带各的词，模型能对上
         # 「这批卡是按什么捞的」。不另传一份词表 —— 那会多出一个判据、多一种形态。
@@ -804,25 +804,18 @@ class KBAutoInjectPlugin:
     ) -> str:
         """检索词 → 检索 → 一屏标题清单。**同步、当场返回**。
 
-        唯一的调用方是 `search_knowledge` 工具 —— 它本身就要把结果交回模型，
-        没法等到下一次请求。注入路径（用户原话、所有工具的 kb_query）都不走这里：
-        一律 `kb_queue` → 后台池 → `handle_llm_request` 拼到请求最后一条消息尾部。
+        唯一的调用方是 `search_knowledge` 工具 —— 它本身就要把结果交回模型。
+        注入路径（用户原话、所有工具的 kb_query）都不走这里：一律 `kb_queue`
+        → 后台池 → 跑完由 `_on_job_done` 攒进待投递槽，等下一次请求贴进副本。
 
         ``top_k`` 是喂给 reranker 的候选数；``max_cards`` 只在**调用方自己点名**时才设
         （`search_knowledge` 的 `limit`），注入路径一律不设 —— 过闸的全印。
 
-        印刷部分全在 `_menu_from_chunks`：同步与异步两条路径共用它，
-        #N 编号、落点去重、老卡重印三条判据因此只有一份实现。
+        印刷部分全在 `_menu_from_chunks`：同步与异步两条路径共用它，渲染只有一份实现。
         """
         _q = (query or "").strip()
         if not _kb_query_is_usable(_q):
             return ""
-        if _q == self._served_query:
-            # 同一个词这一轮已经检索过，清单也已经贴在前面那条结果里了 ——
-            # 再检索一遍只是白烧 rerank，再贴一遍只是把同样的字打进上下文。
-            logger.info("[KBAutoInject] MENU DUP skipped q=%s", _short(_q, 60))
-            return ""
-        self._served_query = _q
         try:
             # top_k 为 None 时 _search_validated 会自己读 retrieval.rerank_top_n ——
             # 这里不再抄一份 `doing_top_k`（那是旧 doing 协议时代的键名，
@@ -839,73 +832,27 @@ class KBAutoInjectPlugin:
         """已检索好的 chunks → 一屏**标题清单**（含 `read_file` 现成的行号）。
 
         与 `_inline_menu` 的唯一差别：检索那一步由调用方先做完。因此本函数**不碰网络**，
-        只做本地计算 + `_shown` 记账 —— 后台线程的产物最终在这里由主线程印刷。
+        只做本地计算 —— 后台线程的产物在这里印刷，主线程只负责把它贴进请求副本。
+
+        **不去重、不记账、不编号**（2026-11-24 晚定案）。检索到几块就印几块：
+        同一批重复贴出来只是多几行字，而一套「印过没有」的账本会漂、会在压缩后
+        失效、会和历史里的残行对不上 —— 那才是真麻烦。
 
         只认一道闸：`min_rerank_score`。过了就是合格块，合格块必须出现在清单里。
-        早先这里还有两道我自加的闸（`MENU_MAX_CARDS=6` 卡数、`MENU_BUDGET=4000` 字数），
-        实测把 19 张过闸卡砍到 6 张，等于让 owner 定的阈值形同虚设 —— 阈值说它合格、
-        另一段代码又把它撤掉，两道判据打架。已整体删除。
-
-        去重的尺度是**落点**，不是整张卡。卡标题只印一次（省字），但同一张卡后来
-        又命中了别的段落，那些段落必须补印 —— 早先按整卡拦，实测 5 次工具调用里
-        53 处（占 58%）首次命中的落点被连坐吞掉，模型连那些段落存在都不知道。
-        **补印时整行重印**（标题 + 体量 + 新落点树 + 路径），不搞「↑ 追加 N 处命中」
-        那种只剩坐标的残行：残行既没有卡标题也没有路径，模型看得见行号却不知道
-        是哪张卡、文件在哪，等于有坐标没对象。
-
-        序号只增不变：同一张卡永远同一个 `#N`，新卡往 `#N+1` 追加，已给出的号永不
-        重排（曾每批重排 → 模型照记忆点序号指错，见 20261023_225015_ea5c533c）。
         """
         _q = (query or "").strip()
-        _screen = self._build_menu(chunks) if chunks else []
-        # 逐卡裁到只留还没印过的落点：新卡全收，老卡只收增量。
-        # 老卡有新落点时**整行重印**（#N + 卡标题 + 整卡体量 + 这棵新命中树 + 路径），
-        # 早先省字省成 `#N ↑ 追加 M 处命中`：标题和路径双双缺席，模型拿到一串行号
-        # 却不知道是哪张卡、文件在哪 —— 有坐标没对象。省下的那点字远不值这个损失。
-        _batch: List[Dict[str, Any]] = []
-        _new_in_batch = 0
-        for it in _screen:
-            _rec = self._shown.get(it["key"])
-            _old = _rec["hits"] if _rec else set()
-            _fresh = [h for h in (it.get("hits") or [])
-                      if (tuple(h.get("chain") or []), int(h.get("a") or 0),
-                          int(h.get("n") or 0)) not in _old]
-            if _rec and not _fresh:
-                continue          # 老卡、零新增落点 —— 真重复，跳过
-            if max_cards is not None and not _rec and _new_in_batch >= max_cards:
-                continue          # 调用方点名的卡数上限，只约束**新卡**
-            _entry = dict(it, hits=_fresh)
-            if _rec:
-                _entry["no"] = _rec["no"]
-            else:
-                _new_in_batch += 1
-            _batch.append(_entry)
-        if not _batch:
-            logger.info(
-                "[KBAutoInject] MENU no-new (已印过 %d 张) q=%s",
-                len(self._shown),
-                _short(_q, 70),
-            )
+        _menu = self._build_menu(chunks) if chunks else []
+        if max_cards is not None:
+            _menu = _menu[:max_cards]
+        if not _menu:
             return ""
-        _new_cards = 0
-        for it in _batch:
-            _rec = self._shown.get(it["key"])
-            if _rec is None:
-                _new_cards += 1
-                it["no"] = len(self._shown) + 1
-                _rec = self._shown[it["key"]] = {"no": it["no"], "hits": set()}
-            _rec["hits"].update(
-                (tuple(h.get("chain") or []), int(h.get("a") or 0), int(h.get("n") or 0))
-                for h in it["hits"]
-            )
         logger.info(
-            "[KBAutoInject] MENU EMIT(+%d 卡 / 累计 %d 卡 / %d 段) q=%s",
-            _new_cards,
-            len(self._shown),
-            sum(len(x["hits"]) for x in _batch),
+            "[KBAutoInject] MENU EMIT(%d 卡 / %d 段) q=%s",
+            len(_menu),
+            sum(len(m.get("hits") or []) for m in _menu),
             _short(_q, 70),
         )
-        return self._render_menu(_batch, _q)
+        return self._render_menu(_menu, _q)
 
     # ============ 唯一的提交口 ============
     #
@@ -913,8 +860,8 @@ class KBAutoInjectPlugin:
     # 两者都只调 `kb_queue`，不看返回值、不判断同步异步 —— 一旦调用方开始看返回值，
     # 就会重新长出第二条注入路径，那正是这一轮拆掉的东西。
     #
-    # 后台线程只跑 retrieve，印刷（`_menu_from_chunks`）全在主线程：
-    # `_shown` / `_served_query` 因此仍然只有主线程写，无竞态。
+    # 后台线程只跑 retrieve 和印刷（`_menu_from_chunks`），产物一律进待投递槽；
+    # `_pending` 由 `_pending_lock` 保护，除此之外没有任何共享账本。
 
     def kb_queue(self, query: str, session_id: str = "") -> None:
         """把检索丢进后台池。**不返回任何东西**。
@@ -923,87 +870,70 @@ class KBAutoInjectPlugin:
         「池里没位置就同步查一次」的降级分支 —— 那个分支就是第三条注入路径。
         池子现在不会因为积压而满：超额时让最老的排队者让位（见 async_pool）。
         返回 ``"full"`` 只剩 executor 已 shutdown 这一种情况，那时记一行 warning。
-        少一次检索的代价，远小于再养一条会互相看不见对方去重账的注入路径。
 
-        ``_served_query`` 只在一个词确实进了池子（``ok``）或池里已有它
-        （``inflight``）时才落标记，所以「没查」和「查过了」在账上分得开。
+        **不判重**：同一个词在同一轮里被两个工具调用都写上，就检索两次、贴两屏。
+        少一次去重账本，换来的是「永远不会有账本和历史对不上」。
         """
         _q = (query or "").strip()
         if not _kb_query_is_usable(_q):
             return
-        if _q == self._served_query:
-            logger.info("[KBAutoInject] kb_queue DUP skipped q=%s", _short(_q, 60))
-            return
         action = self._async_pool.submit(session_id or "default", _q)
         if action in ("ok", "inflight"):
-            self._served_query = _q
             return
         logger.warning(
             "[KBAutoInject] kb_queue DROP (%s) sid=%s q=%s",
             action, (session_id or "default")[:26], _short(_q, 60),
         )
 
-    def kb_take_async_menus(self, session_id: str = "", wait: float = 0.0) -> str:
-        """把后台已完成的检索印成清单（可能多条，空行分隔）。没有就返回空串。
+    # ============ 唯一出口：检索跑完攒起来，下次请求贴进副本 ============
 
-        印刷在主线程做，`_shown` 因此只被一个线程写 —— 这是整个改造的地基。
+    def _on_job_done(
+        self, session_id: str, query: str, chunks: List[Dict[str, Any]]
+    ) -> None:
+        """检索完成的这一刻：清单进待投递槽。后台线程调用。
+
+        不做判断、不查历史、不比对 —— 印出来就排队等着，下一次模型请求
+        由 `handle_llm_request` 取走贴进请求副本（不进 state.db）。
         """
-        rows = self._async_pool.take_done(session_id or "default", wait=wait)
-        if not rows:
-            return ""
-        parts: List[str] = []
-        for _q, _chunks in rows:
-            _menu = self._menu_from_chunks(_q, _chunks)
-            if _menu:
-                parts.append(_menu)
-            else:
-                # 取到结果却印不出东西，只有两种原因，都必须能看见：
-                #   1) 这些落点已经印过（同步路径先占了坑，或同批重复）
-                #   2) 后台检索失败，chunks 是空的
-                # 不打这行的话「注入了」和「全被去重」在日志里长得一模一样。
-                logger.info(
-                    "[KBAutoInject] async take DROP q=%s chunks=%s",
-                    _short(_q, 50), 0 if _chunks is None else len(_chunks),
-                )
-        body = "\n\n".join(parts)
+        _sid = session_id or "default"
+        _menu = self._menu_from_chunks(query, chunks)
+        if not _menu:
+            return
+        with self._pending_lock:
+            self._pending.setdefault(_sid, []).append(_menu)
         logger.info(
-            "[KBAutoInject] async take sid=%s n=%d filled=%d chars=%d",
-            (session_id or "default")[:26], len(rows), len(parts), len(body),
+            "[KBAutoInject] pending MENU chars=%d q=%s sid=%s",
+            len(_menu), _short(query, 60), _sid[:26],
         )
-        return body
 
-    def handle_llm_request(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        """LLM 请求中间件：把后台检索好的清单注入**这次请求最后一条消息的尾部**。
+    def handle_llm_request(
+        self, request: Any = None, session_id: str = "", **kwargs: Any
+    ) -> Optional[Dict[str, Any]]:
+        """每次模型调用前，把攒下的清单贴到最后一条消息尾部。**不进历史**。
 
-        为什么是中间件而不是 pre_llm_call：
-          * `pre_llm_call` 一个 turn 只跑一次（`build_turn_context` 里），而工具调用
-            发生在它之后 —— 后台结果没有第二次注入窗口，只能等到下一条用户消息；
-          * `llm_request` 每次模型调用都跑（工具往返 follow-up、重试都算），
-            正好接住「检索完毕后的下一次请求」。
-
-        代价：注入内容**不进历史**，只在这一屏可见。清单本来就是路标
-        （标题 + 路径 + 行号），模型看到即去 `read_file` 取正文，正文才进历史。
-
-        契约（写错会静默失效）：改了返回 `{"request": <dict>}`，没改返回 `None`。
+        核心（`hermes_cli/middleware.py: apply_llm_request_middleware`）把请求
+        `_safe_copy` 之后交进来，改的是副本，替换 `api_kwargs` 只对这一次调用
+        生效，`state.db` 里一个字都不落 —— 这正是「不进上下文历史」。
+        契约：改了就返回 `{"request": <dict>}`，没改必须返回 `None`。
         """
-        request = kwargs.get("request")
         if not isinstance(request, dict):
             return None
-        session_id = str(kwargs.get("session_id") or "default")
-        body = self.kb_take_async_menus(session_id)
-        if not body:
+        _sid = session_id or "default"
+        with self._pending_lock:
+            _menus = self._pending.pop(_sid, [])
+        if not _menus:
             return None
-        new_request = _append_to_last_message(request, body)
-        if new_request is None:
+        _block = "\n\n".join(_menus)
+        if not _append_to_last_message(request, _block):
             return None
         logger.info(
-            "[KBAutoInject] llm_request INJECT chars=%d sid=%s api_call=%s",
-            len(body), session_id[:26], kwargs.get("api_call_count"),
+            "[KBAutoInject] llm_request INJECT batches=%d chars=%d sid=%s",
+            len(_menus), len(_block), _sid[:26],
         )
         return {
-            "request": new_request,
+            "request": request,
             "name": "hermes-kb-auto-inject",
-            "reason": "async kb menu",
+            "reason": "kb titles tail inject",
         }
 
     def handle_pre_llm_call(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
@@ -1019,27 +949,18 @@ class KBAutoInjectPlugin:
                 str(kwargs.get("session_id"))[:26],
             )
         turn_key = self._turn_key(kwargs)
-        # 新一轮：清空「本轮印过的卡」。清单由 dispatch 层当场填，
-        # 这里不许再按「上一轮的声明」重放任何东西。
-        self._shown = {}
-        self._served_query = ""
-        # 换代：上一轮还堵在队列里的检索全部作废 —— 它们跑完也赶不上这一轮，
-        # 留着只会占住线程，让这一轮的词排在它们后面。同代内不互相淘汰。
-        self._async_pool.begin_round(str(kwargs.get("session_id") or ""))
+        _sid = str(kwargs.get("session_id") or "default")
         context_parts: List[str] = []
         protocol = self._protocol_context(turn_key)
         if protocol:
             context_parts.append(protocol)
-        # 用户原话也参与检索：与工具里的 kb_query 走**同一个提交口**、同一个池、
-        # 同一套 #N，所以这里提交过的词，后面工具调用里不会再查一遍。
-        #
-        # 只提交，不等结果 —— 清单由 `handle_llm_request` 在下一次请求的尾部注入。
-        # 已知代价（这一轮明确接受）：本屏拿不到它，要等第一次工具往返之后那次请求；
-        # 纯问答轮（没有工具调用）则本轮这次检索白跑。换来的是主线程不再为它付
-        # 2.5~15s —— 实测同步路径 14400ms，异步提交 0.24ms。
+        # **这里只提交，不等**。检索跑完由 `_on_job_done` 塞进待投递槽，
+        # 下一次请求由 `handle_llm_request` 贴进副本（上一次请求的请求体早已发出去，
+        # 压着它等只是「同步回答」，owner 不要那个）。
+        # 用户原话与工具里的 kb_query 走**同一个提交口**、同一个池。
         _uq = self._user_query(kwargs)
         if _uq:
-            self.kb_queue(_uq, str(kwargs.get("session_id") or ""))
+            self.kb_queue(_uq, _sid)
         else:
             logger.info(
                 "[KBAutoInject] user-query skipped（原话太短或全是填充词）raw=%s",
@@ -1048,65 +969,38 @@ class KBAutoInjectPlugin:
         return {"context": "\n\n".join(context_parts)} if context_parts else None
 
 
-def _append_to_last_message(request: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
-    """把 *text* 拼到请求最后一条消息的尾部。改不了就返回 ``None``。
 
-    三种 wire 形态都要认（少认一种 = 该条 provider 上静默不注入）：
 
-    * OpenAI chat：``request["messages"]``，最后一条 content 是 str / list / None；
-    * Responses：``request["input"]``，同上，块类型叫 ``input_text``；
-    * Anthropic 的 tool_result 场景：最后一条 user turn 的 content 是 list，
-      里面装着 ``tool_result``。**必须追加该 turn 顶层的兄弟 text 块**，绝不能写进
-      ``tool_result.content`` —— 那样模型会把知识当工具输出读，工具结果的结构契约也坏了。
+def _append_to_last_message(request: Dict[str, Any], block: str) -> bool:
+    """把 *block* 拼到请求里最后一条消息的尾部。改的是**请求副本**，返回是否改成功。
 
-    最后一条若压根没有 ``content`` 键（Responses 的 ``function_call_output`` /
-    ``reasoning`` 之类），**不追加新消息** —— 新增消息会破坏 user/assistant 交替约束，
-    Anthropic 直接 400。这种情况记 warning 并放弃这一次注入（fail-open）。
-
-    幂等：文本已在里面就返回 None，重试路径不会叠第二份。
+    两条 wire 都要认：chat 用 ``messages``，Responses 用 ``input``。
+    最后一条的 content 三种形态都处理 —— 字符串拼在后面、块列表追加一个 text 块、
+    None 直接赋值。Anthropic 的 ``tool_result`` 是 user turn 里的块：**往该 turn
+    顶层追加兄弟 text 块**，绝不写进 ``tool_result.content`` 里（写进去模型看不见）。
     """
-    if not text:
-        return None
     for key in ("messages", "input"):
-        seq = request.get(key)
-        if not isinstance(seq, list) or not seq:
+        msgs = request.get(key)
+        if not isinstance(msgs, list) or not msgs:
             continue
-        last = seq[-1]
+        last = msgs[-1]
+        if isinstance(last, str):
+            msgs[-1] = last + "\n\n" + block
+            return True
         if not isinstance(last, dict):
-            logger.warning("[KBAutoInject] inject skipped: last %s item is %s", key, type(last).__name__)
-            return None
-        blk_type = "input_text" if key == "input" else "text"
-
-        if "content" not in last:
-            logger.warning(
-                "[KBAutoInject] inject skipped: last %s item has no content (keys=%s)",
-                key, sorted(last),
-            )
-            return None
-
+            continue
         content = last.get("content")
-        if isinstance(content, str):
-            if text in content:
-                return None
-            last["content"] = f"{content}\n\n{text}" if content else text
-            return request
         if content is None:
-            last["content"] = text
-            return request
-        if isinstance(content, list):
-            for blk in content:
-                if isinstance(blk, dict) and str(blk.get("text") or "").strip() == text.strip():
-                    return None
-            content.append({"type": blk_type, "text": text})
-            return request
-        logger.warning(
-            "[KBAutoInject] inject skipped: unsupported content type %s in %s",
-            type(content).__name__, key,
-        )
-        return None
-    return None
+            last["content"] = block
+        elif isinstance(content, str):
+            last["content"] = content + "\n\n" + block
+        elif isinstance(content, list):
+            _btype = "input_text" if key == "input" else "text"
+            content.append({"type": _btype, "text": block})
+        else:
+            return False
+        return True
+    return False
 
 
-# 单实例：guard / registration 都要引用它，所以放在类所在模块的底部（谁 import
-# 谁拿到同一个对象，不会出现两个池）。
 plugin_instance = KBAutoInjectPlugin()

@@ -1,8 +1,8 @@
 """对外暴露的那一件东西：`search_knowledge` 工具（schema + handler）。
 
 handler 只有十几行 —— 它**不自己检索**，只把 query 丢给 `plugin_instance._inline_menu`。
-这样主动查库和每轮注入走的是同一条管线、同一个 `#N` 池、同一套去重，
-模型在清单里看到的号，`read_file` 一定拿得到。
+这样主动查库和每轮注入走的是同一条管线、同一个池、同一套渲染，
+模型在清单里看到的路径和行号，`read_file` 一定拿得到。
 """
 
 from typing import Any
@@ -16,7 +16,7 @@ SEARCH_KB_SCHEMA = {
         "主动查本地知识库（排障手册、项目文档、配置指南、反思卡等）。"
         "**返回的是一屏标题清单，不是正文**：每行带绝对路径和命中段行号，"
         "要正文就 `read_file(路径, offset=起行, limit=段行数)` —— 小卡直接整篇读。"
-        "它与每次工具调用自带的 kb_query 走同一条管线、同一份编号，不会重复印同一张卡。"
+        "它与每次工具调用自带的 kb_query 走同一条管线、同一套渲染。"
     ),
     "parameters": {
         "type": "object",
@@ -37,7 +37,7 @@ SEARCH_KB_SCHEMA = {
 
 
 def search_knowledge_handler(args: dict[str, Any], **kw: Any) -> str:
-    """主动查库入口。**与 kb_query 走同一条管线**：检索 → 标题清单 → #N 展开。
+    """主动查库入口。**与 kb_query 走同一条管线**：检索 → 标题清单（路径 + 行号）。
 
     从前这里自己拼一份 JSON（full content 全塞进去），跟注入路径各写一套：
     同一份引擎、两套过滤、两套去重、两套编号 —— 模型在 search_knowledge 里

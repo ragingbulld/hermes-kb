@@ -7,6 +7,7 @@
 
 
 import copy
+import sys
 
 from .plugin_common import (
     KB_FIELD,
@@ -23,6 +24,15 @@ from .plugin_common import (
 )
 from .plugin_class import plugin_instance
 from .registration import search_knowledge_handler
+
+
+def _kb_instance():
+    """取**当前**插件实例。热重载会换掉 ``plugin_class`` 模块对象，补丁里若捕获旧实例，
+    提交就进了旧池子 —— 旧码没有投递口，表现是「检索在跑、历史里却没有行」。
+    因此这里每次从 ``sys.modules`` 现取一遍（2026-11-24 实测踩过这个坑）。
+    """
+    mod = sys.modules.get(__name__.rsplit(".", 1)[0] + ".plugin_class")
+    return getattr(mod, "plugin_instance", None) or plugin_instance
 
 def _install_schema_guard() -> None:
     """给所有工具 schema 注入顶层 kb_query，并在 dispatch 前校验 + 剥离。
@@ -191,12 +201,17 @@ def _install_schema_guard() -> None:
                     tool=_eff,
                 )
 
-            # kb_query 只有一个去向：丢进后台池。工具照常执行，清单一律由
-            # `handle_llm_request` 在下一次模型请求的**尾部**注入 —— 与用户原话那条
-            # 完全同一条管道、同一个池、同一套去重账。
+            # kb_query 只有一个去向：丢进后台池。工具照常执行，**检索一跑完**
+            # 就由池子的完成回调把清单排进待投递槽，下一次模型请求由 `llm_request`
+            # 中间件贴进请求副本尾部 —— 与用户原话那条同一个池。不等工具返回、
+            # 不压请求，所以本轮后面还有没有工具、是不是纯问答轮，都不影响它送达。
+            #
+            # 为什么不在这里等结果、当场同步检索：2~8 秒的延迟要每个工具调用都背一遍。
+            # 为什么不写进会话历史：那会在库里留一行假 user 消息，被压缩重放，
+            # 越滚越多；请求副本改完即弃，库里一个字不落。
             #
             # 这里**不做任何分档**。早先按「只读 / 危险」分两路：危险工具当场同步查
-            # 并把清单贴在工具结果里。代价是两套去重账互不可见 —— 同一个词可能查两遍，
+            # 并把清单贴在工具结果里。代价是两条通道各记各的账 —— 同一个词可能查两遍，
             # 也可能两边都以为对方查过，结果谁都没查。
             #
             # 全是豁免工具（search_knowledge / 沉淀三件套）就整条不检索：
@@ -204,7 +219,7 @@ def _install_schema_guard() -> None:
             # 沉淀工具写卡时也不必顺带搜一遍库。
             if _kb_query:
                 try:
-                    plugin_instance.kb_queue(
+                    _kb_instance().kb_queue(
                         _kb_query, str(kwargs.get("session_id") or "")
                     )
                 except Exception as exc:  # noqa: BLE001

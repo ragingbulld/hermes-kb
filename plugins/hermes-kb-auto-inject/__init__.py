@@ -10,7 +10,7 @@
     resident.py        核心工具常驻（防「加载成功但注入全哑」）
 
 拆之前的形态是 1502 行单文件，上面这些职责全堆在 `__init__.py` 里。
-设计骨架没动：清单化投递、单池归一、轮作用域去重、fail-open 一个不少。
+设计骨架没动：清单化投递、单池归一、fail-open 一个不少；去重账整套删了。
 """
 
 import hashlib
@@ -48,21 +48,17 @@ def _kb_tool_emoji(tool_name: str) -> str:
 
 
 def register(ctx: Any) -> None:
-    """注册四样东西：pre_llm_call 钩子、llm_request 中间件、search_knowledge 工具、
-    kb_query 门禁补丁。
+    """注册三样东西：注入中间件、search_knowledge 工具、kb_query 门禁补丁。
 
-    两个注入入口分工不同，别混：
+    **出口只有一个，时机是「下一次模型请求之前」**：检索结果一返回，池子回调
+    ``plugin_instance._on_job_done``，把标题清单排进待投递槽；中间件
+    ``handle_llm_request`` 在每次请求前取空槽，贴到最后一条消息尾部。
 
-    * ``pre_llm_call``（**每 turn 一次**，进历史）：用户原话检索 + 协议提示词。
-      它拼进 user 消息的 api_content 侧车，所以后续每一轮都会跟着重放。
-    * ``llm_request``（**每次模型调用都过**，不进历史）：后台检索好的 kb_query 清单，
-      拼在这次请求最后一条消息的尾部。工具调用发生在 pre_llm_call 之后，
-      只有中间件能接住「检索完毕后的下一次请求」。
+    改的是 ``_safe_copy`` 出来的**请求副本**，``state.db`` 一个字都不落 ——
+    「当次就能看见、而且不进历史」这两件同时成立，靠的就是这一层。
 
-    中间件那条路的修改按设计不持久化（core 在 hermes_cli/middleware.py 用
-    ``_safe_copy`` 隔离 request）—— 这正好是我们要的：清单一屏可见、不落历史、
-    不参与前缀缓存比对。代价是它也不会被记住，所以清单里必须带齐 read_file 的
-    绝对路径和命中段行号，模型看到即去取正文，正文才进历史。
+    ``pre_llm_call`` 只剩一件事：把用户原话丢进池子（纯问答轮也要有检索）。
+    它**不返回清单**，所以不拖慢首字；也不维护任何去重账 —— 账本整套删了。
     """
     _install_schema_guard()
     # 沙箱侧两件事（必须在门禁装好之后：它们只打标记 / 放宽签名，不放宽判据）：
@@ -76,8 +72,8 @@ def register(ctx: Any) -> None:
     # 判据也不可延迟，却永远进不了 `_select_tool_names`，模型侧就没有。
     # `file` 的证据：gateway 的会话 pin 里 read_file/patch/write_file/search_files 全在，
     # 说明 `file` 一定被 enable。
+    # 入口一：每 turn 提交用户原话。出口：llm_request 中间件贴进请求副本。
     ctx.register_hook("pre_llm_call", plugin_instance.handle_pre_llm_call)
-    # 后台检索的注入端（每次模型调用都过；不进历史，只在这一屏可见）。
     ctx.register_middleware("llm_request", plugin_instance.handle_llm_request)
     
     # 注册主动查库工具 search_knowledge
@@ -125,7 +121,7 @@ def register(ctx: Any) -> None:
     # 曾写成 `registered: md5=`，与判据对不上，改动明明已装载却天天报「需 reload」。
     logger.info(
         "hermes-kb-auto-inject code md5=%s (%s 行, %s 个模块) registered — kb_query 门禁 + 标题清单池 "
-        "+ pre_llm_call 协议注入；检索入口三条：用户原话（每轮一次）+ kb_query 同步（危险工具，"
-        "清单贴本条结果）+ kb_query 异步（只读工具，llm_request 尾部注入）",
+        "+ 单注入出口（llm_request 中间件贴请求副本尾部，不落 state.db、不等工具、不压请求）；"
+        "检索入口两条：用户原话（每轮一次）+ 每次工具调用的 kb_query，同一池；**无去重账**",
         _md5, _lines, len([p for p in _pl.Path(__file__).parent.glob("*.py")]),
     )

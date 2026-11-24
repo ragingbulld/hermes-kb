@@ -5,6 +5,8 @@ author: "Hermes"
 entrypoint: "__init__.py"
 provides_hooks:
   - pre_llm_call
+provides_middleware:
+  - llm_request
 provides_tools:
   - search_knowledge
 # 官方 PM 会在构建插件运行环境时安装这些依赖（pyproject [project].dependencies 的
