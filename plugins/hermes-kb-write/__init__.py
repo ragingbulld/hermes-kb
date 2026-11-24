@@ -1287,6 +1287,14 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
             }, ensure_ascii=False)
 
     # 落卡
+    # title 归一：调用方常把分类前缀直接写进 title，而下面按 kind 又拼一次 ——
+    # 结果就是「# [排障SOP] [排障SOP] …」这种双前缀脏 H1。它会被 chunker 原样
+    # 带进 heading_path，之后卡标题、判重 title、confirm_title 全跟着脏。
+    # 这里剥掉已有的同名前缀（循环是为了连写两三遍也清干净），拼接因此幂等。
+    _prefix = f"[{kind}] "
+    while title.startswith(_prefix):
+        title = title[len(_prefix):].strip()
+
     stamp = time.strftime("%Y-%m-%d-%H%M")
     filename = f"{stamp}-{_slugify(title)}.md"
     tag_line = ""
