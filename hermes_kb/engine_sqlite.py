@@ -309,9 +309,14 @@ class KBEngine:
         # 增量向量存储（预分配 + tombstone），替代原来的 _vec_ids/_vec_mat 全量拷贝
         self._vs = _VectorStore(self._dim)
         # 跨进程新鲜度探针：watcher 是独立进程，它写库本进程看不见。
-        # 判据是库文件指纹（主库 + -wal 的 mtime/size），不是 PRAGMA data_version
-        # —— 后者实测在 WAL 模式下跨连接提交后纹丝不动，靠不住。
-        self._db_sig = None
+        # 判据是 (chunk 行数, MAX(updated_at))，不是文件指纹 —— WAL 自动
+        # checkpoint 会改 -wal 的 mtime/size，数据没变也会被判成 stale
+        # （实测同一 turn 内因此白重载了一次）。也不是 PRAGMA data_version
+        # —— 那个在 WAL 模式下跨连接提交后纹丝不动。
+        # 常驻一条只读连接：每次新建连接要 150ms（open + WAL pragma），
+        # 复用后配合 updated_at 索引约 3ms。
+        self._db_state = None
+        self._probe_conn = None
 
         self._init_db()
         self._ensure_cache_model()
@@ -373,6 +378,11 @@ class KBEngine:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_chunks_text_hash ON chunks(text_hash)"
+            )
+            # 跨进程新鲜度判据要查 MAX(updated_at)：无索引是全表扫描（实测 104ms），
+            # 有索引 0.004ms。写入侧每次 INSERT 多维护一个索引，写卡是低频操作。
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_updated ON chunks(updated_at)"
             )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS kb_meta ("
@@ -583,64 +593,76 @@ class KBEngine:
             # 进锁后重判：等锁期间别的线程可能已经载完
             if self._vs.loaded and not self._vectors_stale():
                 return self._vs
-            # 先取签名再读数据：读的瞬间之后若 watcher 又写，能被下次检测抓到
-            sig_before = self._db_sig_now()
+            # 先取状态再读数据：读的瞬间之后若 watcher 又写，下次检测能抓到
+            state_before = self._db_state_now()
             t0 = time.time()
             self._load_vectors()
-            self._db_sig = sig_before
+            self._db_state = state_before
             logger.info("[KBEngine] vector load took %.2fs", time.time() - t0)
         return self._vs
 
     # ---------------------------------------------------- 跨进程新鲜度（watcher）
-    def _db_sig_now(self):
-        """库文件指纹：主库与 -wal 的 (mtime_ns, size)。
+    def _db_state_now(self):
+        """库的当前状态：(chunk 行数, 最大 updated_at)。
 
-        WAL 模式下写入只落 ``-wal``，主库 mtime 不动，所以两个文件都要看。
-        文件不存在时占位 (0, 0)，不影响比较的稳定性。
+        外部进程（watcher）改库，这两项至少一项会变：
+        - 新增 / 替换 chunk → updated_at 更新（ON CONFLICT 里带 excluded.updated_at）
+        - 删文件 → 行数减少
+        常驻一条只读连接，因为 _conn() 每次新建要 150ms；配 idx_chunks_updated
+        之后整个查询约 3ms。
         """
-        sig = []
-        for p in (self.kb_path, self.kb_path + "-wal"):
-            try:
-                st = os.stat(p)
-                sig.append((st.st_mtime_ns, st.st_size))
-            except OSError:
-                sig.append((0, 0))
-        return tuple(sig)
+        if self._probe_conn is None:
+            self._probe_conn = self._conn()
+        row = self._probe_conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM chunks"
+        ).fetchone()
+        return (int(row[0]), float(row[1]))
 
     def _vectors_stale(self) -> bool:
         """磁盘上的库比内存向量新，就返回 True。**只读，不改状态。**
 
-        watcher 是独立进程，它写库时本进程的内存向量不会自己更新。判据用文件
-        指纹 —— ``PRAGMA data_version`` 实测在 WAL 模式下连同一进程的两个连接
-        提交后都纹丝不动，靠不住。
+        watcher 是独立进程，它写库时本进程的内存向量不会自己更新。
 
-        刻意不在这里推进 ``_db_sig``：``_ensure_vectors`` 会连续调用两次（进锁前、
-        进锁后），若检测器带副作用，第二次就会误判为已新鲜而跳过重载。推进基准
-        由 ``_ensure_vectors`` 载完后 / ``_ack_db_sig()`` 显式负责。
+        判据选用行数 + MAX(updated_at)，绕开了两个坑：
+        - ``PRAGMA data_version``：实测在 WAL 模式下跨连接提交后纹丝不动
+        - 文件指纹（mtime/size）：WAL 自动 checkpoint 会改 ``-wal``，数据没变
+          也被判成 stale，实测同一 turn 内白重载一次
+
+        刻意不在这里推进 ``_db_state``：``_ensure_vectors`` 会连续调用两次（进锁
+        前、进锁后），检测器若带副作用，第二次就会误判为已新鲜而跳过重载。
         """
-        sig = self._db_sig_now()
-        if self._db_sig is None:
-            self._db_sig = sig
+        try:
+            state = self._db_state_now()
+        except sqlite3.Error as e:
+            # 探针坏了不该拖垮检索：宁可多载一次，不可直接报错
+            logger.warning("[KBEngine] db state probe failed: %s", e)
+            self._probe_conn = None  # 下次重建连接
+            return True
+        if self._db_state is None:
+            self._db_state = state
             return False
-        return sig != self._db_sig
+        return state != self._db_state
 
-    def _ack_db_sig(self) -> None:
-        """承认内存已跟上磁盘：把基准推到当前文件状态。
+    def _ack_db_state(self) -> None:
+        """承认内存已跟上磁盘：把基准推到当前库状态。
 
         自己写完库后调用（内存已由 _append_vectors/_remove_vectors 同步，
         不该再触发一次全量重载）。
         """
-        self._db_sig = self._db_sig_now()
+        try:
+            self._db_state = self._db_state_now()
+        except sqlite3.Error:
+            self._db_state = None
 
     def _append_vectors(self, ids, vecs):
         if ids:
             self._vs.append(ids, vecs)
-            self._ack_db_sig()
+            self._ack_db_state()
 
     def _remove_vectors(self, ids):
         if ids:
             self._vs.remove(ids)
-            self._ack_db_sig()
+            self._ack_db_state()
 
     # ------------------------------------------------------- embedding / rerank
     def compute_embedding(self, text: str, abort=None) -> list:
