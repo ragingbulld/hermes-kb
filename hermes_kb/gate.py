@@ -18,10 +18,11 @@ class GatedSearch(NamedTuple):
     below: int  # 有重排分但低于阈值
     unscored: int  # 没有重排分
     min_score: float
+    fallback: int = 0  # 兜底放行的块数（重排整体失败时才 >0）
 
     @property
     def dropped(self) -> int:
-        return self.below + self.unscored
+        return self.below + self.unscored - self.fallback
 
 
 def gated_search(
@@ -38,13 +39,26 @@ def gated_search(
     results = engine.search(query, limit=candidate_limit, rerank_top_n=top_n)
 
     kept: List[Dict[str, Any]] = []
+    unscored_rows: List[Dict[str, Any]] = []
     below = unscored = 0
     for result in results:
         score = result.get("rerank_score")
         if score is None:
             unscored += 1
+            unscored_rows.append(result)
         elif score >= min_score:
             kept.append(result)
         else:
             below += 1
-    return GatedSearch(kept, len(results), below, unscored, min_score)
+
+    # 兜底：只在「重排**整体**失败」时触发 —— 这一批结果**一条分都没拿到**。
+    # 只要有任意一条拿到了分（哪怕全低于阈值），就说明重排本身是通的，那些没分
+    # 的块是重排没返回的，按融合名次放行等于往上下文灌噪音。
+    # 这与「阈值是唯一闸门」不冲突：它不是过闸后的二次筛选（MENU_MAX_CARDS 那类），
+    # 而是阈值**无法判定**时的替代判定 —— 没有分数，就退回引擎给的融合名次取前 N。
+    fallback = 0
+    if results and not kept and unscored == len(results):
+        fallback = min(int(cfg["fallback_keep"]), len(unscored_rows))
+        kept = unscored_rows[:fallback]
+
+    return GatedSearch(kept, len(results), below, unscored, min_score, fallback)

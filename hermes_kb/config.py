@@ -71,6 +71,11 @@ DEFAULT_CONFIG = {
         # 去噪闸门：低于此重排分的块直接丢弃。这是**唯一**的合格判定 ——
         # 不叠条数 / 字数 / 断崖第二判据（见 docs/TUNING.md）。换模型必须重标定。
         "min_rerank_score": 0.65,
+        # 重排整体失败（一条分都没拿到）时兜底放行的条数，按引擎的融合名次取前 N。
+        # 不设这个，reranker 一超时就是整轮 0 注入 —— 2026-11-24 实测 ai.gitee.com
+        # 拥塞窗口里 kept=0 连中 9 次，注入块整屏消失。只兜「没分」这一种，
+        # 分数低于阈值仍然照丢。
+        "fallback_keep": 3,
         "use_reranker": True,
         # 排序键：hybrid = 分段取键，rerank >= hybrid_rank_threshold 的饱和区按
         #   rrf_score 排（该段 rerank 挤在 1.0 附近，跨度仅 0.08，无区分度），

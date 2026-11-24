@@ -6,6 +6,8 @@
 """
 
 
+import copy
+
 from .plugin_common import (
     KB_FIELD,
     KB_QUERY_DESCRIPTION,
@@ -75,7 +77,15 @@ def _install_schema_guard() -> None:
                 params = function.get("parameters")
                 if not isinstance(params, dict):
                     params = {"type": "object", "properties": {}}
-                    function["parameters"] = params
+                else:
+                    # registry._definition() 用 {**entry.schema, ...} 浅拷贝，
+                    # function["parameters"] 与 entry.schema["parameters"] 是同一个 dict。
+                    # v0.23.2 起 tools/arg_validation 拿 entry.schema 的 required 校验入参，
+                    # 原地 append kb_query 会污染注册表 —— 变成「schema 要求 kb_query、
+                    # dispatch 又把它 pop 掉」的自相矛盾，所有内置工具一调即死。
+                    # 深拷贝后只改返回给模型的这份，注册表保持原样。
+                    params = copy.deepcopy(params)
+                function["parameters"] = params
                 properties = params.get("properties")
                 if not isinstance(properties, dict):
                     properties = {}
@@ -140,7 +150,6 @@ def _install_schema_guard() -> None:
                 args.pop(key, None)
             return original_dispatch(self, name, args, *pos_args, **kwargs)
 
-        _kb_attach = ""
         if isinstance(args, dict):
             from tools.registry import tool_error
 
@@ -182,28 +191,34 @@ def _install_schema_guard() -> None:
                     tool=_eff,
                 )
 
-            # kb_query 当场变成标题清单贴回**这条**工具结果，不等下一轮 ——
-            # 首轮、单轮会话因此也拿得到知识。
+            # kb_query 只有一个去向：丢进后台池。工具照常执行，清单一律由
+            # `handle_llm_request` 在下一次模型请求的**尾部**注入 —— 与用户原话那条
+            # 完全同一条管道、同一个池、同一套去重账。
+            #
+            # 这里**不做任何分档**。早先按「只读 / 危险」分两路：危险工具当场同步查
+            # 并把清单贴在工具结果里。代价是两套去重账互不可见 —— 同一个词可能查两遍，
+            # 也可能两边都以为对方查过，结果谁都没查。
             #
             # 全是豁免工具（search_knowledge / 沉淀三件套）就整条不检索：
             # 展开自己就是「去库里取」，再检索一次只会多贴一屏没人要的清单；
             # 沉淀工具写卡时也不必顺带搜一遍库。
             if _kb_query:
                 try:
-                    _kb_attach = plugin_instance._inline_menu(_kb_query)
+                    plugin_instance.kb_queue(
+                        _kb_query, str(kwargs.get("session_id") or "")
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("[KBAutoInject] inline attach failed (%s): %s", name, exc)
+                    logger.warning(
+                        "[KBAutoInject] kb_queue failed (%s): %s", name, exc
+                    )
             # 剥离：元参数只给本插件取词，底层工具不认识它
             for key in _STRIP_KEYS:
                 args.pop(key, None)
-        _kb_result = original_dispatch(self, name, args, *pos_args, **kwargs)
-        if _kb_attach:
-            return f"{_kb_result}\n\n{_kb_attach}"
-        return _kb_result
+        return original_dispatch(self, name, args, *pos_args, **kwargs)
 
     ToolRegistry.dispatch = patched_dispatch
     logger.info(
-        "[KBAutoInject] kb_query schema + dispatch gate installed "
+        "[KBAutoInject] kb_query schema + dispatch gate installed [v2-single-exit] "
         "(fail-open exempts: %s).",
         ", ".join(sorted(_EXEMPT_TOOLS)),
     )
