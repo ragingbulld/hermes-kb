@@ -34,8 +34,8 @@ __all__ = ["AbortSlot", "KBEngine", "get_engine"]
 # 单例放在插件里只活一轮，等于没有缓存。本模块挂在 sys.path 上、不参与插件
 # reload，模块级变量才能跨轮活下来。
 #
-# 外部进程（watcher daemon）的写入由 KBEngine 内部的库文件指纹探针
-# （_vectors_stale）发现，这里不用管。
+# 外部进程（watcher daemon）的写入由 KBEngine 内部的库状态探针
+# （_vectors_stale，比 chunk 行数 + MAX(updated_at)）发现，这里不用管。
 
 _ENGINE = None
 _ENGINE_LOCK = threading.Lock()
