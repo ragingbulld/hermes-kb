@@ -416,6 +416,23 @@ class KBAutoInjectPlugin:
             "n": geo[1],
         }
 
+    @staticmethod
+    def _chain_parts(chunk: Dict[str, Any]) -> List[str]:
+        """``heading_path`` → 层级数组，**H1 用 chunk 自带的，不再拿 " > " 去切它**。
+
+        单层卡的 ``heading_path`` 就是 H1 本身（没有分隔符）；标题里一旦含
+        " > "（例如「…用 " > " 拼层级…」），``_path_parts`` 会把它割成好几段，
+        凭空长出假小节。H1 已知时按前缀整段剥掉，剩下的才交给分隔符去拆。
+        """
+        hp = str(chunk.get("heading_path") or "")
+        h1 = str(chunk.get("h1") or "").strip()
+        if h1 and hp.startswith(h1):
+            rest = hp[len(h1):].lstrip("\x1f").strip()
+            if rest.startswith(">"):
+                rest = rest[1:].strip()
+            return [h1] + (_path_parts(rest) if rest else [])
+        return _path_parts(hp)
+
     @classmethod
     def _card_chain(cls, chunk: Dict[str, Any]) -> List[str]:
         """菜单第二行：这张卡里命中的那一段，在标题树里的**完整路径**。
@@ -435,7 +452,7 @@ class KBAutoInjectPlugin:
         返回**段列表**，不自己拼字符串：渲染层要把它画成逐级缩进的树（owner：挤在
         一行看不出结构，`A > B > C` 得写成一行一层）。
         """
-        parts = _path_parts(chunk.get("heading_path"))
+        parts = cls._chain_parts(chunk)
         if len(parts) < 2:
             return []
         segs = []
