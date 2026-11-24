@@ -313,10 +313,13 @@ class KBEngine:
         # checkpoint 会改 -wal 的 mtime/size，数据没变也会被判成 stale
         # （实测同一 turn 内因此白重载了一次）。也不是 PRAGMA data_version
         # —— 那个在 WAL 模式下跨连接提交后纹丝不动。
-        # 常驻一条只读连接：每次新建连接要 150ms（open + WAL pragma），
-        # 复用后配合 updated_at 索引约 3ms。
+        # 探针连接按线程各持一条：sqlite3 连接不能跨线程用（``check_same_thread``
+        # 默认 True，跨线程直接 ProgrammingError，实测 12 分钟 86 次探针失败，
+        # 每次都判 stale 白重载）。共享单条连接 + 全局锁能修掉报错，但那把锁会把
+        # 并发检索串行化；``threading.local`` 无锁、无竞争，连接数只等于活跃线程数。
+        # 每次新建要 150ms（open + WAL pragma），复用后配 updated_at 索引约 3ms。
         self._db_state = None
-        self._probe_conn = None
+        self._probe_local = threading.local()
 
         self._init_db()
         self._ensure_cache_model()
@@ -608,12 +611,16 @@ class KBEngine:
         外部进程（watcher）改库，这两项至少一项会变：
         - 新增 / 替换 chunk → updated_at 更新（ON CONFLICT 里带 excluded.updated_at）
         - 删文件 → 行数减少
-        常驻一条只读连接，因为 _conn() 每次新建要 150ms；配 idx_chunks_updated
-        之后整个查询约 3ms。
+        探针连接按线程各持一条（``threading.local``）。sqlite3 连接不能跨线程，
+        共享一条会在并发检索线程里直接抛 ProgrammingError。只读连接挂
+        ``query_only``，杜绝探针误写。配 idx_chunks_updated 之后整个查询约 3~5ms。
         """
-        if self._probe_conn is None:
-            self._probe_conn = self._conn()
-        row = self._probe_conn.execute(
+        conn = getattr(self._probe_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.kb_path, timeout=30.0)
+            conn.execute("PRAGMA query_only=ON")
+            self._probe_local.conn = conn
+        row = conn.execute(
             "SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM chunks"
         ).fetchone()
         return (int(row[0]), float(row[1]))
@@ -634,9 +641,16 @@ class KBEngine:
         try:
             state = self._db_state_now()
         except sqlite3.Error as e:
-            # 探针坏了不该拖垮检索：宁可多载一次，不可直接报错
+            # 探针坏了不该拖垮检索：宁可多载一次，不可直接报错。
+            # 只清当前线程这条：别的线程的连接可能好好的。
             logger.warning("[KBEngine] db state probe failed: %s", e)
-            self._probe_conn = None  # 下次重建连接
+            conn = getattr(self._probe_local, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                self._probe_local.conn = None
             return True
         if self._db_state is None:
             self._db_state = state
