@@ -1287,13 +1287,13 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
             }, ensure_ascii=False)
 
     # 落卡
-    # title 归一：调用方常把分类前缀直接写进 title，而下面按 kind 又拼一次 ——
-    # 结果就是「# [排障SOP] [排障SOP] …」这种双前缀脏 H1。它会被 chunker 原样
-    # 带进 heading_path，之后卡标题、判重 title、confirm_title 全跟着脏。
-    # 这里剥掉已有的同名前缀（循环是为了连写两三遍也清干净），拼接因此幂等。
-    _prefix = f"[{kind}] "
-    while title.startswith(_prefix):
-        title = title[len(_prefix):].strip()
+    # title 归一：调用方常把分类前缀直接写进 title，而 H1 又要按 kind 拼一次 ——
+    # 与其让两边各猜一遍，不如在这里一次剥净。归一后的 title 就是**全流程唯一
+    # 可信的卡标题**：H1、文件名、回执、_recent_writes、索引全部由它派生，下游
+    # 不再需要任何「去掉前缀」的补救。正则而非 while：前缀与标题之间未必有空格
+    # （`[排障SOP][排障SOP]x` 也要能剥），而且意图是「开头连续的同名前缀全去掉」，
+    # 不是「试试还有没有下一层」。异类前缀（kind 不同）原样保留，不越权。
+    title = re.sub(rf"^(?:\[{re.escape(kind)}\]\s*)+", "", title).strip()
 
     stamp = time.strftime("%Y-%m-%d-%H%M")
     filename = f"{stamp}-{_slugify(title)}.md"
