@@ -35,6 +35,54 @@ from .plugin_common import (
 # 现在只剩一个提交口 `kb_queue`、一个注入口 `handle_llm_request`。
 
 
+# heading_path 的层级分隔符。新数据用不可见字符（见 hermes_kb/chunker.py 的
+# PATH_SEP），老数据仍是 " > "。**标题本身可能含 " > "**，所以老数据存在误切，
+# 重建索引后自然消失。
+_PATH_SEP = "\x1f"
+
+
+def _path_parts(heading_path) -> List[str]:
+    """把 heading_path 拆成层级数组。
+
+    新数据用不可见分隔符，拆开就是层级，零歧义。老数据是 ``" > "`` 拼的，
+    而**标题本身也可能含 " > "** —— 例如「输出上限超出上游模型限制
+    （64000 > 32768）」会被切成两段，卡标题只剩「…（64000」。
+
+    所以老格式拆完还要过一次 ``_rebalance``：靠括号是否闭合把误切的两半合回去。
+    括号平衡是确定性信号，不是猜 —— 正常切开的老数据每段本来就平衡，不会被合。
+    """
+    hp = str(heading_path or "")
+    if not hp:
+        return []
+    if _PATH_SEP in hp:
+        return [x.strip() for x in hp.split(_PATH_SEP) if x.strip()]
+    return _rebalance([x.strip() for x in hp.split(" > ") if x.strip()])
+
+
+_OPEN = "（([【《"
+_CLOSE = "）)]】》"
+
+
+def _rebalance(parts: List[str]) -> List[str]:
+    """把被标题内容里的 " > " 误切开的片段合回去。
+
+    判据只有一条：括号没闭合。逐段累加，直到开闭括号数配平才算一段结束。
+    正常切分的每段天然平衡，所以这个函数对它们是恒等的。
+    """
+    out: List[str] = []
+    buf = ""
+    for p in parts:
+        buf = f"{buf} > {p}" if buf else p
+        opens = sum(buf.count(c) for c in _OPEN)
+        closes = sum(buf.count(c) for c in _CLOSE)
+        if opens <= closes:
+            out.append(buf)
+            buf = ""
+    if buf:                       # 末尾仍未配平：原样带上，不丢内容
+        out.append(buf)
+    return out
+
+
 class KBAutoInjectPlugin:
     """Execution-state-driven knowledge base retriever and API-bound injector."""
 
@@ -132,8 +180,10 @@ class KBAutoInjectPlugin:
         ``title`` ≤8 字，是「症状」「避坑铁律」「根因」「LEGAL」这种东西），拿它当
         卡片标题等于没给。``heading_path`` 全库 0 条缺失，第一段就是卡片 H1。
         """
-        hp = str(chunk.get("heading_path") or "").strip()
-        h1 = re.split(r"\s+>\s+", hp)[0] if hp else ""
+        # 走 _path_parts 而不是 re.split(" > ")：标题本身可能含 " > "，
+        # 例如「…模型限制（64000 > 32768）」会被割成「…（64000」。
+        _parts = _path_parts(chunk.get("heading_path"))
+        h1 = _parts[0] if _parts else ""
         # 长卡切段时 H1 会被写成 "…(Part 1)/(Part 2)"，剥掉，否则同一张卡看着像三张
         h1 = re.sub(r"(?:\s*\(Part \d+\))+$", "", h1).strip()
         if len(h1) <= 8:
@@ -335,7 +385,7 @@ class KBAutoInjectPlugin:
             # 自己的 H1 那一行才算开始；照文件总行数印「行 1~N」，模型抄下去就会
             # 把上一张卡的内容一起读进来。heading_path 第一段就是这张卡的 H1。
             _h1 = self._clean_heading(
-                str(chunk.get("heading_path") or "").split(" > ")[0]
+                (_path_parts(chunk.get("heading_path")) or [""])[0]
             )
             _cs, _cl = 0, 0
             if _h1:
@@ -402,7 +452,7 @@ class KBAutoInjectPlugin:
         返回**段列表**，不自己拼字符串：渲染层要把它画成逐级缩进的树（owner：挤在
         一行看不出结构，`A > B > C` 得写成一行一层）。
         """
-        parts = [p.strip() for p in str(chunk.get("heading_path") or "").split(" > ") if p.strip()]
+        parts = _path_parts(chunk.get("heading_path"))
         if len(parts) < 2:
             return []
         segs = []

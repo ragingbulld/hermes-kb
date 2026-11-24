@@ -915,7 +915,12 @@ class KBEngine:
                     )
                 ).hexdigest()
                 heading = c.get("heading_path", "") or ""
-                title = heading.split(" > ")[-1] if " > " in heading else heading
+                # 优先用切分时带来的末级小节名。回退那条只对老 chunker 的产物
+                # 生效 —— 它按 " > " 反推，标题本身含 " > " 时会切错
+                # （实测「（64000 > 32768）」被切成「32768）」）。
+                title = c.get("title") or (
+                    heading.split(" > ")[-1] if " > " in heading else heading
+                )
                 content = c.get("content", "") or ""
                 token_estimate = int(
                     c.get("char_count", len(content)) / 2
@@ -1170,7 +1175,12 @@ class KBEngine:
                     f"{file_path}::{i}::{c.get('content', '')[:50]}".encode("utf-8")
                 ).hexdigest()
                 heading = c.get("heading_path", "") or ""
-                title = heading.split(" > ")[-1] if " > " in heading else heading
+                # 优先用切分时带来的末级小节名。回退那条只对老 chunker 的产物
+                # 生效 —— 它按 " > " 反推，标题本身含 " > " 时会切错
+                # （实测「（64000 > 32768）」被切成「32768）」）。
+                title = c.get("title") or (
+                    heading.split(" > ")[-1] if " > " in heading else heading
+                )
                 content = c.get("content", "") or ""
                 token_estimate = int(c.get("char_count", len(content)) / 2)
                 text_hash = self._text_key(self._chunk_text(c))

@@ -3,6 +3,13 @@ import os
 import re
 
 
+# 标题层级的分隔符。**不能用 " > "** —— 标题本身就可能含它，例如
+# 「输出上限超出上游模型限制（64000 > 32768）」会被下游拆成两级，卡标题
+# 只剩「…（64000」。\x1f 是 ASCII 单元分隔符，正文里不可能出现，拿它拼
+# 层级不存在歧义；显示侧照旧渲染成 " > "。
+PATH_SEP = "\x1f"
+
+
 class MarkdownChunker:
     """Split Markdown into bounded, heading-aware chunks.
 
@@ -31,6 +38,7 @@ class MarkdownChunker:
             if chunk_text:
                 sections.append({
                     "heading_path": self._build_path_str(current_headings),
+                    "title": self._deepest(current_headings),
                     "content": chunk_text,
                 })
 
@@ -66,6 +74,7 @@ class MarkdownChunker:
         if not sections and content.strip():
             sections.append({
                 "heading_path": raw_doc_title,
+                "title": raw_doc_title,
                 "content": content.strip(),
             })
 
@@ -91,6 +100,7 @@ class MarkdownChunker:
                 # 归属用 heading_path 表达，第几片用 part_index 表达，两者不混。
                 bounded_sections.append({
                     "heading_path": sec["heading_path"],
+                    "title": sec.get("title", ""),
                     "part_index": sub_idx + 1 if len(sub_chunks) > 1 else 0,
                     "content": sub_text,
                 })
@@ -126,7 +136,7 @@ class MarkdownChunker:
             final_chunks.append(
                 self._make_chunk(
                     file_path, sec["heading_path"], sec["content"], idx,
-                    sec.get("part_index") or 0,
+                    sec.get("part_index") or 0, sec.get("title") or "",
                 )
             )
         return final_chunks
@@ -137,15 +147,27 @@ class MarkdownChunker:
         non_empty = [line.strip() for line in text.splitlines() if line.strip()]
         return bool(non_empty) and all(heading_pattern.match(line) for line in non_empty)
 
+    @staticmethod
+    def _deepest(headings_dict) -> str:
+        """末级标题（最深层那一级）。
+
+        **不能用 `heading_path.split(" > ")[-1]` 反推**：标题本身可能含 `" > "`
+        —— 例如 `… 输出上限超出上游模型限制（64000 > 32768）`，反推会切成
+        `32768）`。层级信息在这里是全的（level → text），直接取最深一级即可。
+        """
+        if not headings_dict:
+            return ""
+        return str(headings_dict[max(headings_dict)]).strip()
+
     def _build_path_str(self, headings_dict):
         crumbs = []
         for level in sorted(headings_dict):
             value = str(headings_dict[level]).strip()
             if value and (not crumbs or crumbs[-1] != value):
                 crumbs.append(value)
-        return " > ".join(crumbs) if crumbs else "知识库文档"
+        return PATH_SEP.join(crumbs) if crumbs else "知识库文档"
 
-    def _make_chunk(self, file_path, heading_path, content, index, part_index=0):
+    def _make_chunk(self, file_path, heading_path, content, index, part_index=0, title=""):
         vector_text = f"【路径】{heading_path}\n\n{content}"
         chunk_id = hashlib.md5(
             f"{file_path}::{index}::{content[:50]}".encode("utf-8")
@@ -154,6 +176,9 @@ class MarkdownChunker:
             "chunk_id": chunk_id,
             "file_path": file_path,
             "heading_path": heading_path,
+            # 末级小节名。由切分时直接给出，不从上层的 heading_path 反推
+            # （标题里可能含 " > "，反推必有损）。
+            "title": title or "",
             # 同一节被切成多片时的序号（1 起），整节一块则为 0。
             # 它是「位置」不是章节名：不进 heading_path，也不进向量文本。
             "part_index": int(part_index or 0),
