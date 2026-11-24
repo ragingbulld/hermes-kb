@@ -19,6 +19,6 @@ FTS5 存 bigram 展开正文，向量走内存矩阵暴力余弦（61k 行 15.7m
 **不使用 ANN**：6 万行暴力扫描已足够快。未来涨到百万级再评估 sqlite-vec。
 """
 
-from .engine_sqlite import KBEngine  # noqa: F401
+from .engine_sqlite import AbortSlot, KBEngine  # noqa: F401
 
-__all__ = ["KBEngine"]
+__all__ = ["AbortSlot", "KBEngine"]

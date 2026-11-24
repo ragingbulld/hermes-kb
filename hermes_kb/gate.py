@@ -30,13 +30,20 @@ def gated_search(
     query: str,
     candidate_limit: Optional[int] = None,
     top_n: Optional[int] = None,
+    abort: Any = None,
 ) -> GatedSearch:
-    """`engine.search` + 重排分闸门。`top_n` 为 None 时由 engine 取 `rerank_top_n`。"""
+    """`engine.search` + 重排分闸门。`top_n` 为 None 时由 engine 取 `rerank_top_n`。
+
+    ``abort`` 原样透传给 engine（一个 ``AbortSlot``）：后台池用它掐断正在跑的
+    请求。不走这条路的调用方（CLI、显式工具）传 None 即可，行为不变。
+    """
     cfg = engine.config["retrieval"]
     min_score = float(cfg["min_rerank_score"])
     if candidate_limit is None:
         candidate_limit = cfg["candidate_limit"]
-    results = engine.search(query, limit=candidate_limit, rerank_top_n=top_n)
+    results = engine.search(
+        query, limit=candidate_limit, rerank_top_n=top_n, abort=abort
+    )
 
     kept: List[Dict[str, Any]] = []
     unscored_rows: List[Dict[str, Any]] = []

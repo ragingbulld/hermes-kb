@@ -693,6 +693,7 @@ class KBAutoInjectPlugin:
         top_k: Optional[int] = None,
         candidate_limit: Optional[int] = None,
         tag: str = "retrieve summary",
+        abort: Any = None,
     ) -> List[Dict[str, Any]]:
         """统一检索入口：注入路径（retrieve_chunk）与主动查库（search_knowledge）共用。
 
@@ -707,7 +708,8 @@ class KBAutoInjectPlugin:
             from hermes_kb.gate import gated_search
 
             gated = gated_search(
-                self.engine, query, candidate_limit=candidate_limit, top_n=top_k
+                self.engine, query, candidate_limit=candidate_limit, top_n=top_k,
+                abort=abort,
             )
             # [留痕] 单行检索摘要：事后可直接回答「阈值卡掉多少张」
             logger.info(
@@ -732,6 +734,7 @@ class KBAutoInjectPlugin:
         query: str,
         top_k: Optional[int] = None,
         candidate_limit: Optional[int] = None,
+        abort: Any = None,
     ) -> List[Dict[str, Any]]:
         """注入路径的检索入口。参数解析与闸门全在 `_search_validated`，这里只贴标签。
 
@@ -739,7 +742,8 @@ class KBAutoInjectPlugin:
           `_search_validated` 逐字重复 —— 两处一旦分叉就会静默漂移，已删。）
         """
         return self._search_validated(
-            query, top_k=top_k, candidate_limit=candidate_limit, tag="retrieve summary"
+            query, top_k=top_k, candidate_limit=candidate_limit,
+            tag="retrieve summary", abort=abort,
         )
 
     def _inline_menu(
@@ -862,10 +866,11 @@ class KBAutoInjectPlugin:
     def kb_queue(self, query: str, session_id: str = "") -> None:
         """把检索丢进后台池。**不返回任何东西**。
 
-        为什么返回 None 而不是状态：调用方一旦能看见 ``"full"``，就会写出
-        「池满就同步查一次」的降级分支 —— 那个分支就是第三条注入路径。
-        池满时干脆丢掉这次检索，记一行 warning。少一次检索的代价，
-        远小于再养一条会互相看不见对方去重账的注入路径。
+        为什么返回 None 而不是状态：调用方一旦能看见状态，就会写出
+        「池里没位置就同步查一次」的降级分支 —— 那个分支就是第三条注入路径。
+        池子现在不会因为积压而满：超额时让最老的排队者让位（见 async_pool）。
+        返回 ``"full"`` 只剩 executor 已 shutdown 这一种情况，那时记一行 warning。
+        少一次检索的代价，远小于再养一条会互相看不见对方去重账的注入路径。
 
         ``_served_query`` 只在一个词确实进了池子（``ok``）或池里已有它
         （``inflight``）时才落标记，所以「没查」和「查过了」在账上分得开。
@@ -965,6 +970,9 @@ class KBAutoInjectPlugin:
         # 这里不许再按「上一轮的声明」重放任何东西。
         self._shown = {}
         self._served_query = ""
+        # 换代：上一轮还堵在队列里的检索全部作废 —— 它们跑完也赶不上这一轮，
+        # 留着只会占住线程，让这一轮的词排在它们后面。同代内不互相淘汰。
+        self._async_pool.begin_round(str(kwargs.get("session_id") or ""))
         context_parts: List[str] = []
         protocol = self._protocol_context(turn_key)
         if protocol:

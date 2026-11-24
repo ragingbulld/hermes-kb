@@ -48,11 +48,21 @@ def _kb_tool_emoji(tool_name: str) -> str:
 
 
 def register(ctx: Any) -> None:
-    """注册三样东西：pre_llm_call 钩子（唯一注入点，块直接落 api_content）、
-    search_knowledge 工具、以及 kb_query 门禁补丁。
+    """注册四样东西：pre_llm_call 钩子、llm_request 中间件、search_knowledge 工具、
+    kb_query 门禁补丁。
 
-    不再注册 llm_request 中间件 —— core 在 hermes_cli/middleware.py 用 _safe_copy
-    隔离 request，那条路上的任何修改按设计都不可能持久化。
+    两个注入入口分工不同，别混：
+
+    * ``pre_llm_call``（**每 turn 一次**，进历史）：用户原话检索 + 协议提示词。
+      它拼进 user 消息的 api_content 侧车，所以后续每一轮都会跟着重放。
+    * ``llm_request``（**每次模型调用都过**，不进历史）：后台检索好的 kb_query 清单，
+      拼在这次请求最后一条消息的尾部。工具调用发生在 pre_llm_call 之后，
+      只有中间件能接住「检索完毕后的下一次请求」。
+
+    中间件那条路的修改按设计不持久化（core 在 hermes_cli/middleware.py 用
+    ``_safe_copy`` 隔离 request）—— 这正好是我们要的：清单一屏可见、不落历史、
+    不参与前缀缓存比对。代价是它也不会被记住，所以清单里必须带齐 read_file 的
+    绝对路径和命中段行号，模型看到即去取正文，正文才进历史。
     """
     _install_schema_guard()
     # 沙箱侧两件事（必须在门禁装好之后：它们只打标记 / 放宽签名，不放宽判据）：
@@ -67,6 +77,8 @@ def register(ctx: Any) -> None:
     # `file` 的证据：gateway 的会话 pin 里 read_file/patch/write_file/search_files 全在，
     # 说明 `file` 一定被 enable。
     ctx.register_hook("pre_llm_call", plugin_instance.handle_pre_llm_call)
+    # 后台检索的注入端（每次模型调用都过；不进历史，只在这一屏可见）。
+    ctx.register_middleware("llm_request", plugin_instance.handle_llm_request)
     
     # 注册主动查库工具 search_knowledge
     ctx.register_tool(
@@ -113,6 +125,7 @@ def register(ctx: Any) -> None:
     # 曾写成 `registered: md5=`，与判据对不上，改动明明已装载却天天报「需 reload」。
     logger.info(
         "hermes-kb-auto-inject code md5=%s (%s 行, %s 个模块) registered — kb_query 门禁 + 标题清单池 "
-        "+ pre_llm_call 协议注入；检索入口两条：用户原话（每轮一次）+ kb_query",
+        "+ pre_llm_call 协议注入；检索入口三条：用户原话（每轮一次）+ kb_query 同步（危险工具，"
+        "清单贴本条结果）+ kb_query 异步（只读工具，llm_request 尾部注入）",
         _md5, _lines, len([p for p in _pl.Path(__file__).parent.glob("*.py")]),
     )

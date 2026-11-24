@@ -18,12 +18,16 @@
 """
 
 import hashlib
+import http.client
+import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
+from urllib.parse import urlsplit
 
 import numpy as np
 import requests
@@ -31,6 +35,107 @@ import requests
 from .config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+class AbortSlot:
+    """一次检索的中断句柄：把阻塞在读上的 HTTP 请求当场掐断。
+
+    线程杀不死，但它正在读的那个 fd 关得掉 —— ``socket.shutdown(SHUT_RDWR)``
+    之后，阻塞中的 ``getresponse()`` 立刻抛 ``RemoteDisconnected``，线程当场
+    退出（实测 <1ms）。这是 CPython 里唯一干净的「取消正在跑的请求」手段。
+
+    池层每个后台任务持有一个；engine 在请求建立后 ``bind`` 上 socket。
+    ``cancel()`` 发生在 bind 之前 / 之中 / 之后都安全：
+      * 之前 —— 只置标记，下一次 bind 立刻掐断；
+      * 之中 —— 直接 shutdown，读操作当场醒；
+      * 之后 —— socket 已 unbind，什么也不做。
+    """
+
+    __slots__ = ("_lock", "_sock", "_cancelled", "_budget", "_used")
+
+    def __init__(self, max_attempts: int | None = None) -> None:
+        self._lock = threading.Lock()
+        self._sock = None
+        self._cancelled = False
+        # None = 不限次数（异步池路径）：只要没人喊停，就一直试。
+        # 同步路径（CLI / 显式工具）传一个数字，否则上游真挂了会永远转。
+        self._budget = max_attempts
+        self._used = 0
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    @property
+    def stopped(self) -> bool:
+        """还要不要再试。**唯一判据**，调用方只看这一处。
+
+        * ``cancelled`` —— 调用方不要了，socket 已经掐断；
+        * 额度用尽     —— 只有同步路径（``max_attempts`` 非 None）才会发生。
+
+        异步池里的 slot 没有额度，唯一的出口就是 ``cancel()`` —— 而 ``cancel``
+        只发生在池位不够的时候。换句话说：**旧的跑多久都行，只有新的要位置时
+        才让位**，不需要「这一轮翻篇了」这种额外的收工条件。
+        """
+        if self._cancelled:
+            return True
+        budget = self._budget
+        return budget is not None and self._used >= budget
+
+    def __iter__(self):
+        """``for attempt in abort:`` —— 这就是这个类的全部用法。
+
+        判据（``stopped``）、计数（``tick``）、编号（1 起）都封在这里，调用方
+        不用自己写 ``while not stopped``，也不用在每个日志里 ``attempt + 1``。
+        """
+        while not self.stopped:
+            yield self.tick()
+
+    def tick(self) -> int:
+        """取一次尝试额度，返回本次是第几次（从 1 开始）。"""
+        with self._lock:
+            self._used += 1
+            return self._used
+
+    def bind(self, sock) -> None:
+        """登记当前正在阻塞的 socket；若此前已 cancel，立刻掐断。"""
+        with self._lock:
+            self._sock = sock
+            fire = self._cancelled
+        if fire:
+            _shutdown_socket(sock)
+
+    def unbind(self) -> None:
+        """请求结束、连接即将 close 前调用 —— 别让 cancel 打到复用的 fd 上。"""
+        with self._lock:
+            self._sock = None
+
+    def cancel(self) -> bool:
+        """掐断。返回是否真 shutdown 了一个 socket（未 bind 时只置标记）。"""
+        with self._lock:
+            self._cancelled = True
+            sock = self._sock
+        if sock is None:
+            return False
+        return _shutdown_socket(sock)
+
+
+def _shutdown_socket(sock) -> bool:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+        return True
+    except OSError:
+        return False
+
+
+# 同步路径（CLI、显式工具调用）的重试兜底。异步池不传 abort 时也会落到这里 ——
+# 但池里每个任务都带自己的 slot（无额度），所以正常检索永远走「不限次数」。
+_SYNC_ATTEMPTS = 3
+
+
+def _slot(abort):
+    """没传 slot 就造一个带额度的：同步路径上没人会来喊停。"""
+    return abort or AbortSlot(_SYNC_ATTEMPTS)
 
 
 class _VectorStore:
@@ -478,11 +583,21 @@ class KBEngine:
             self._vs.remove(ids)
 
     # ------------------------------------------------------- embedding / rerank
-    def compute_embedding(self, text: str) -> list:
+    def compute_embedding(self, text: str, abort=None) -> list:
+        """单条向量。和 rerank 一样：重试不设上限，唯一出口是 ``abort.stopped``。
+
+        ``requests`` 拿不到 fd，掐不断正在读的那一次 —— 但 ``stopped`` 会在下一次
+        尝试之前生效，所以最坏只多等一个 ``timeout``。
+        """
+        abort = _slot(abort)
         emb_cfg = self.config.get("embedding", {})
         api_key = emb_cfg.get("api_key", "")
         base_url = emb_cfg.get("base_url", "https://api.siliconflow.cn/v1")
         model = emb_cfg.get("model", "BAAI/bge-m3")
+        # 单条超时（秒）。2026-11-24 由硬编码 15 改为读配置，默认 5。
+        # 注意：config 里 embedding.timeout 曾是死配置（写着 60 却从没被读过），
+        # 现在真读，所以实盘值必须同步改小，否则会从 15s 变成 60s。
+        _emb_timeout = float(emb_cfg.get("timeout", 5))
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -494,24 +609,58 @@ class KBEngine:
             "encoding_format": "float",
         }
 
-        for _ in range(3):
+        _errs = []
+        for attempt in abort:
+            _t0 = time.monotonic()
             try:
                 res = requests.post(
-                    f"{base_url}/embeddings", headers=headers, json=payload, timeout=15
+                    f"{base_url}/embeddings", headers=headers, json=payload,
+                    timeout=_emb_timeout,
                 )
                 if res.status_code == 200:
                     data = res.json()
                     return data["data"][0]["embedding"]
+                _errs.append(f"HTTP{res.status_code} {res.text[:120]}")
+                logger.warning(
+                    "[KBEngine] embed attempt %d non-200: status=%s in %.0fms body=%s",
+                    attempt, res.status_code,
+                    (time.monotonic() - _t0) * 1000, res.text[:200],
+                )
                 time.sleep(0.5)
-            except Exception:
+            except Exception as exc:
+                _errs.append(f"{type(exc).__name__}: {exc}")
+                logger.warning(
+                    "[KBEngine] embed attempt %d raised %s after %.0fms: %s",
+                    attempt, type(exc).__name__,
+                    (time.monotonic() - _t0) * 1000, exc,
+                )
                 time.sleep(0.5)
+        if abort.cancelled:
+            logger.info(
+                "[KBEngine] embed cancelled by caller after %d attempt(s) "
+                "(url=%s text_len=%d)",
+                len(_errs), f"{base_url}/embeddings", len(text),
+            )
+            return []
+        logger.warning(
+            "[KBEngine] embed gave up after %d attempt(s) (sync limit): url=%s "
+            "text_len=%d timeout=%gs errors=%s",
+            len(_errs), f"{base_url}/embeddings", len(text), _emb_timeout, _errs,
+        )
         return []
 
     def compute_embeddings_batch(
-        self, texts: list, batch_size: int = None, max_workers: int = 8
+        self, texts: list, batch_size: int = None, max_workers: int = 8, abort=None
     ) -> list:
+        """批量向量。批次之间共用一份取消状态，但**各自计次**。
+
+        12 批并行共用一个计数器会互相偷额度 —— 谁先失败谁把别人的次数吃掉。
+        所以批次用尽自己的次数不算失败，而是降级到 ``compute_embedding`` 逐条取，
+        那条路不限次数。这里的 ``_SYNC_ATTEMPTS`` 只是「什么时候别再整批试」。
+        """
         if not texts:
             return []
+        abort = _slot(abort)
         emb_cfg = self.config.get("embedding", {})
         # batch_size 必须读配置：此前默认硬编码 32，导致每次请求发 32 条切片
         # ≈ 2.1 万 token，超出小批量上限（约 1.2 万 token）→ 全被计为大批量扣费。
@@ -524,6 +673,10 @@ class KBEngine:
         api_key = emb_cfg.get("api_key", "")
         base_url = emb_cfg.get("base_url", "https://api.siliconflow.cn/v1")
         model = emb_cfg.get("model", "BAAI/bge-m3")
+        # 批量超时（秒）。2026-11-24 由硬编码 30 改为读配置，默认 15。
+        _emb_batch_timeout = float(emb_cfg.get("batch_timeout", 15))
+        # 单条超时（fallback 逐条时用，与 compute_embedding 同源同默认）
+        _emb_timeout = float(emb_cfg.get("timeout", 5))
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -540,23 +693,39 @@ class KBEngine:
                 "input": truncated_texts,
                 "encoding_format": "float",
             }
-            for _ in range(3):
-                try:
-                    res = requests.post(
-                        f"{base_url}/embeddings",
-                        headers=headers,
-                        json=payload,
-                        timeout=30,
-                    )
-                    if res.status_code == 200:
-                        data = res.json()
-                        data_sorted = sorted(data["data"], key=lambda x: x["index"])
-                        return batch_idx, [item["embedding"] for item in data_sorted]
-                    time.sleep(0.5)
-                except Exception:
-                    time.sleep(0.5)
-            # fallback single
-            return batch_idx, [self.compute_embedding(t) for t in batch_items]
+            # 整批**不重试**：同一批 token 量、同一份超时，重发多半还是同一份超时，
+            # 白白多等一个 batch_timeout。一次不成直接降到逐条 —— 小请求更容易过，
+            # 那条路本来就不限次数。
+            if abort.stopped:
+                return batch_idx, []
+            _t0 = time.monotonic()
+            try:
+                res = requests.post(
+                    f"{base_url}/embeddings",
+                    headers=headers,
+                    json=payload,
+                    timeout=_emb_batch_timeout,
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    return batch_idx, [
+                        item["embedding"]
+                        for item in sorted(data["data"], key=lambda x: x["index"])
+                    ]
+                logger.warning(
+                    "[KBEngine] embed-batch %d non-200: status=%s in %.0fms body=%s",
+                    batch_idx, res.status_code, (time.monotonic() - _t0) * 1000, res.text[:200],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[KBEngine] embed-batch %d raised %s after %.0fms: %s",
+                    batch_idx, type(exc).__name__, (time.monotonic() - _t0) * 1000, exc,
+                )
+            logger.info(
+                "[KBEngine] embed-batch %d -> per-item (%d items x up to %gs each, batch timeout was %gs)",
+                batch_idx, len(batch_items), _emb_timeout, _emb_batch_timeout,
+            )
+            return batch_idx, [self.compute_embedding(t, abort=abort) for t in batch_items]
 
         # ---- 按「条数上限 + 字符预算」双重切组 ----
         # 只按条数切不够：单请求 token 超过约 1.2 万会被 Gitee 判为大批量
@@ -602,15 +771,25 @@ class KBEngine:
             )
         return all_embs
 
-    def rerank_pairs(self, query: str, documents: list) -> list:
+    def rerank_pairs(self, query: str, documents: list, abort=None) -> list:
+        """候选精排。重试次数**不设上限**，唯一出口是 ``abort.stopped``。
+
+        异步池传进来的 slot 没有额度，只要没人喊停就一直试，唯一的出口是池位
+        不够时的 ``cancel()``。同步路径（CLI、显式工具）不传，这里补一个
+        ``_SYNC_ATTEMPTS`` 兜底 —— 那种场景没有人会来喊停，上游真挂了必须自己收手。
+        """
         if not documents:
             return []
+        abort = _slot(abort)
         rerank_cfg = self.config.get("reranker", {})
         api_key = rerank_cfg.get("api_key", "")
         base_url = rerank_cfg.get(
             "base_url", "https://api.siliconflow.cn/v1/rerank"
         )
         model = rerank_cfg.get("model", "BAAI/bge-reranker-v2-m3")
+        # 单次超时（秒）。2026-11-24 由硬编码 15 改为读配置，默认 5。
+        # 曾有过 reranker.timeout 键但代码从未读取（2026-10-21 已删），这次是真读。
+        _req_timeout = float(rerank_cfg.get("timeout", 5))
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -630,42 +809,94 @@ class KBEngine:
         # 分不清是连不上、超时还是 5xx —— 2026-10-25 统计 25 次降级时就是盲的。
         # 这里按 attempt 逐次记异常类型/状态码/耗时，末尾再汇总一次。
         _rt_errs = []
-        for attempt in range(3):
+        for attempt in abort:
             _t0 = time.monotonic()
             try:
-                res = requests.post(req_url, headers=headers, json=payload, timeout=15)
+                status, body = self._post_rerank(
+                    req_url, headers, payload, _req_timeout, abort
+                )
                 _dt = (time.monotonic() - _t0) * 1000
-                if res.status_code == 200:
-                    data = res.json()
+                if status == 200:
+                    data = json.loads(body or "{}")
                     results = data.get("results", [])
-                    if attempt:
+                    if attempt > 1:
                         logger.info(
-                            "[KBEngine] rerank recovered on attempt %d/3 in %.0fms (prev errors: %s)",
-                            attempt + 1, _dt, _rt_errs,
+                            "[KBEngine] rerank recovered on attempt %d in %.0fms (prev errors: %s)",
+                            attempt, _dt, _rt_errs,
                         )
                     return sorted(
                         results, key=lambda x: x["relevance_score"], reverse=True
                     )
                 # 非 200：把状态码和响应体前 200 字记下来（大量 4xx/5xx 都死在这一行）
-                _rt_errs.append(f"HTTP{res.status_code} {res.text[:200]}")
+                _rt_errs.append(f"HTTP{status} {body[:200]}")
                 logger.warning(
-                    "[KBEngine] rerank attempt %d/3 non-200: status=%s in %.0fms body=%s",
-                    attempt + 1, res.status_code, _dt, res.text[:200],
+                    "[KBEngine] rerank attempt %d non-200: status=%s in %.0fms body=%s",
+                    attempt, status, _dt, body[:200],
                 )
                 time.sleep(0.5)
             except Exception as exc:
                 _dt = (time.monotonic() - _t0) * 1000
+                # 被调用方掐断：这不是故障，是「不要了」，别再重试也别刷警告。
+                if abort.cancelled:
+                    logger.info(
+                        "[KBEngine] rerank cancelled mid-flight after %.0fms (url=%s docs=%d)",
+                        _dt, req_url, len(documents),
+                    )
+                    break
                 _rt_errs.append(f"{type(exc).__name__}: {exc}")
                 logger.warning(
-                    "[KBEngine] rerank attempt %d/3 raised %s after %.0fms: %s",
-                    attempt + 1, type(exc).__name__, _dt, exc,
+                    "[KBEngine] rerank attempt %d raised %s after %.0fms: %s",
+                    attempt, type(exc).__name__, _dt, exc,
                 )
                 time.sleep(0.5)
+        _tried = len(_rt_errs)
+        if abort.cancelled:
+            # 「不要了」不是「拿不到」：降级是调用方主动选的，别刷 warning 误导排障。
+            logger.info(
+                "[KBEngine] rerank abandoned after %d attempt(s), cancelled by caller "
+                "(url=%s docs=%d)",
+                _tried, req_url, len(documents),
+            )
+            return []
         logger.warning(
-            "[KBEngine] rerank gave up after 3 attempts: url=%s docs=%d timeout=15s errors=%s",
-            req_url, len(documents), _rt_errs,
+            "[KBEngine] rerank gave up after %d attempt(s) (sync limit): url=%s docs=%d "
+            "timeout=%gs errors=%s",
+            _tried, req_url, len(documents), _req_timeout, _rt_errs,
         )
         return []
+
+    def _post_rerank(self, url: str, headers: dict, payload: dict,
+                     timeout: float, abort):
+        """发一次 rerank POST，返回 ``(status, body_text)``。
+
+        不用 ``requests``：它的连接藏在 Session 池里，外面拿不到 fd，也就没法
+        从另一个线程把正在阻塞的读掐断。``http.client`` 把 ``conn.sock`` 直接
+        暴露出来，这是「取消正在跑的请求」能成立的唯一前提。
+        """
+        parts = urlsplit(url)
+        https = parts.scheme == "https"
+        conn_cls = http.client.HTTPSConnection if https else http.client.HTTPConnection
+        conn = conn_cls(
+            parts.hostname, parts.port or (443 if https else 80), timeout=timeout
+        )
+        conn.connect()
+        try:
+            if abort is not None:
+                abort.bind(conn.sock)      # 从这一刻起，外部 cancel() 能掐断它
+            path = parts.path or "/"
+            if parts.query:
+                path += "?" + parts.query
+            conn.request(
+                "POST", path,
+                body=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8", "replace")
+        finally:
+            if abort is not None:
+                abort.unbind()             # 先解绑再关，别让 cancel 打到复用的 fd
+            conn.close()
 
     # -------------------------------------------------------------- 写入/删除
     def add_chunks(self, chunks: list):
@@ -1134,9 +1365,30 @@ class KBEngine:
         rerank_top_n=None,
         use_reranker=None,
         rank_by=None,
+        abort=None,
     ) -> list:
         if not query or not query.strip():
             return []
+        _t0 = time.perf_counter()
+        # 分段计时：三个 return 点都从 _finish 走，否则「快」和「空」在日志里分不开。
+        # 在此之前 retrieve summary 只有 cand/kept/dropped，一个毫秒数都没有，
+        # 「异步省了多少」只能靠 submit→INJECT 的时间差猜，而那段里混着工具执行与模型生成。
+        # 现在能直接看出瓶颈是 embedding、FTS 还是 rerank（rerank 超时会顶到 15s+）。
+        _phase = {"emb": 0.0, "vec": 0.0, "fts": 0.0, "rr": 0.0}
+
+        def _finish(items, fused=None):
+            # 注意 `vec` 的计时起点在 embedding 之前，所以 **emb ⊂ vec**：
+            #   total ≈ vec + fts + rerank，别再单独加 emb（会重复算一次）。
+            logger.info(
+                "[KBEngine] search n=%d total=%.0fms | emb=%.0f vec=%.0f(含emb) fts=%.0f rerank=%.0f "
+                "| fused=%s | q=%s",
+                len(items), (time.perf_counter() - _t0) * 1000,
+                _phase["emb"], _phase["vec"], _phase["fts"], _phase["rr"],
+                "-" if fused is None else fused,
+                " ".join(str(q_clean).split())[:60],
+            )
+            return items
+
         q_clean = query.strip()
         retrieval_cfg = self.config["retrieval"]
         vector_limit = max(1, int(limit or retrieval_cfg["candidate_limit"]))
@@ -1166,8 +1418,11 @@ class KBEngine:
                 item[f"_{source}_rank"] = rank
                 item["rrf_score"] += 1.0 / (rrf_k + rank)
         # ---- 向量路：内存矩阵暴力余弦
+        _t_vec = time.perf_counter()
         try:
-            q_vec = self.compute_embedding(q_clean)
+            _t_emb = time.perf_counter()
+            q_vec = self.compute_embedding(q_clean, abort=abort)
+            _phase["emb"] = (time.perf_counter() - _t_emb) * 1000
             if q_vec:
                 vs = self._ensure_vectors()
                 if vs.stats()["size"] > 0:
@@ -1192,6 +1447,8 @@ class KBEngine:
                     add_ranked(ordered, "vector")
         except Exception as e:
             logger.warning("[KBEngine] Vector search error: %s", e)
+        finally:
+            _phase["vec"] = (time.perf_counter() - _t_vec) * 1000
 
         # ---- FTS 路：BM25 词或（OR + ORDER BY rank），无命中才收窄 token 重试
         # 不再预处理 q_clean：_fts_tokens 的正则本来就把 ｜|# 之类当分隔符，
@@ -1202,6 +1459,7 @@ class KBEngine:
         # fts5 的 ORDER BY rank 就是 bm25()，「命中词多」天然排在「命中词少」
         # 前面，加权是排序器自带的；旧的全 AND 写法把这个能力废掉了，退化成
         # 精确匹配，缺一个 token 就整条淘汰。实测 GT 命中 3/6 → 5/6。
+        _t_fts = time.perf_counter()
         if q_clean:
             try:
                 expr = self._build_fts_expr(q_clean)
@@ -1251,6 +1509,7 @@ class KBEngine:
                     )
             except Exception as e:
                 logger.debug("[KBEngine] FTS search skipped: %s", e)
+        _phase["fts"] = (time.perf_counter() - _t_fts) * 1000
 
         fused_candidates = sorted(
             candidates_map.values(),
@@ -1269,7 +1528,7 @@ class KBEngine:
             deduped_candidates.append(item)
         fused_candidates = deduped_candidates
         if not fused_candidates:
-            return []
+            return _finish([], 0)
 
         # RRF 后再交给 Cross-Encoder Reranker 精排。
         if use_reranker is None:
@@ -1283,7 +1542,11 @@ class KBEngine:
             docs_to_rerank = [
                 f"{c.get('heading_path', '')}\n{c.get('content', '')}" for c in _rr_pool
             ]
-            rerank_results = self.rerank_pairs(q_clean, docs_to_rerank)
+            _t_rr = time.perf_counter()
+            rerank_results = self.rerank_pairs(
+                q_clean, docs_to_rerank, abort=abort
+            )
+            _phase["rr"] = (time.perf_counter() - _t_rr) * 1000
         else:
             logger.info(
                 "[KBEngine] Reranker disabled (use_reranker=false); returning RRF order, q=%s",
@@ -1368,7 +1631,7 @@ class KBEngine:
                     item["score_source"] = "reranker"
                     final_list.append(item)
                 if final_list:
-                    return final_list
+                    return _finish(final_list, len(fused_candidates))
 
         # Reranker 超时、返回空数组或返回坏索引时，保留 RRF 结果。
         # 不能让缺失 rerank_score 被下游当成 0 分，从而全量丢失召回。
@@ -1382,7 +1645,7 @@ class KBEngine:
                 "[KBEngine] Reranker unavailable or invalid; using RRF fallback for %d result(s)",
                 len(final_list),
             )
-        return final_list
+        return _finish(final_list, len(fused_candidates))
 
     # ------------------------------------------------------------------ 维护
     def reconcile_and_prune_dead_files(self) -> int:
