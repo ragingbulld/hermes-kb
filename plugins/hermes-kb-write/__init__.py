@@ -220,8 +220,10 @@ def _get_engine():
         return _engine
     try:
         _ensure_hermes_kb_importable()
-        from hermes_kb.engine import KBEngine
-        _engine = KBEngine()
+        # 进程级单例：检索侧拿到的也是这一个实例，写入时 _append_vectors
+        # 更新的内存索引检索侧立刻可见。
+        from hermes_kb.engine import get_engine
+        _engine = get_engine()
         logger.info("[KBWrite] KBEngine ready for dedup gate")
     except Exception as e:
         logger.warning("[KBWrite] KBEngine unavailable (%s); dedup gate disabled", e)

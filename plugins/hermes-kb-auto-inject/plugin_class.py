@@ -96,9 +96,12 @@ class KBAutoInjectPlugin:
                 if self._engine is None:
                     # 局部导入：把 6~7s 的重库加载成本推迟到首次真实检索，
                     # 避免撞 Hermes 插件 10s 加载门禁导致钩子被 ignored。
-                    from hermes_kb.engine import KBEngine
+                    # get_engine() 是进程级单例（hermes_kb/engine.py）：
+                    # 插件每轮 reload 会把 self._engine 归零，但模块级实例不受影响，
+                    # 向量库因此只加载一次，而不是每轮 1~2 s 重载 6.7 万行。
+                    from hermes_kb.engine import get_engine
 
-                    self._engine = KBEngine()
+                    self._engine = get_engine()
         return self._engine
 
     def _turn_key(self, kwargs: Dict[str, Any], messages: Any = None) -> str:

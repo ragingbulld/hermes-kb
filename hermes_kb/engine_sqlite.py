@@ -308,6 +308,10 @@ class KBEngine:
         self._dim = int(self.config.get("embedding", {}).get("dimensions", 1024) or 1024)
         # 增量向量存储（预分配 + tombstone），替代原来的 _vec_ids/_vec_mat 全量拷贝
         self._vs = _VectorStore(self._dim)
+        # 跨进程新鲜度探针：watcher 是独立进程，它写库本进程看不见。
+        # 判据是库文件指纹（主库 + -wal 的 mtime/size），不是 PRAGMA data_version
+        # —— 后者实测在 WAL 模式下跨连接提交后纹丝不动，靠不住。
+        self._db_sig = None
 
         self._init_db()
         self._ensure_cache_model()
@@ -573,21 +577,70 @@ class KBEngine:
         )
 
     def _ensure_vectors(self):
-        if not self._vs.loaded:
-            with self._vec_lock:
-                if not self._vs.loaded:
-                    t0 = time.time()
-                    self._load_vectors()
-                    logger.info("[KBEngine] vector load took %.2fs", time.time() - t0)
+        if self._vs.loaded and not self._vectors_stale():
+            return self._vs
+        with self._vec_lock:
+            # 进锁后重判：等锁期间别的线程可能已经载完
+            if self._vs.loaded and not self._vectors_stale():
+                return self._vs
+            # 先取签名再读数据：读的瞬间之后若 watcher 又写，能被下次检测抓到
+            sig_before = self._db_sig_now()
+            t0 = time.time()
+            self._load_vectors()
+            self._db_sig = sig_before
+            logger.info("[KBEngine] vector load took %.2fs", time.time() - t0)
         return self._vs
+
+    # ---------------------------------------------------- 跨进程新鲜度（watcher）
+    def _db_sig_now(self):
+        """库文件指纹：主库与 -wal 的 (mtime_ns, size)。
+
+        WAL 模式下写入只落 ``-wal``，主库 mtime 不动，所以两个文件都要看。
+        文件不存在时占位 (0, 0)，不影响比较的稳定性。
+        """
+        sig = []
+        for p in (self.kb_path, self.kb_path + "-wal"):
+            try:
+                st = os.stat(p)
+                sig.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append((0, 0))
+        return tuple(sig)
+
+    def _vectors_stale(self) -> bool:
+        """磁盘上的库比内存向量新，就返回 True。**只读，不改状态。**
+
+        watcher 是独立进程，它写库时本进程的内存向量不会自己更新。判据用文件
+        指纹 —— ``PRAGMA data_version`` 实测在 WAL 模式下连同一进程的两个连接
+        提交后都纹丝不动，靠不住。
+
+        刻意不在这里推进 ``_db_sig``：``_ensure_vectors`` 会连续调用两次（进锁前、
+        进锁后），若检测器带副作用，第二次就会误判为已新鲜而跳过重载。推进基准
+        由 ``_ensure_vectors`` 载完后 / ``_ack_db_sig()`` 显式负责。
+        """
+        sig = self._db_sig_now()
+        if self._db_sig is None:
+            self._db_sig = sig
+            return False
+        return sig != self._db_sig
+
+    def _ack_db_sig(self) -> None:
+        """承认内存已跟上磁盘：把基准推到当前文件状态。
+
+        自己写完库后调用（内存已由 _append_vectors/_remove_vectors 同步，
+        不该再触发一次全量重载）。
+        """
+        self._db_sig = self._db_sig_now()
 
     def _append_vectors(self, ids, vecs):
         if ids:
             self._vs.append(ids, vecs)
+            self._ack_db_sig()
 
     def _remove_vectors(self, ids):
         if ids:
             self._vs.remove(ids)
+            self._ack_db_sig()
 
     # ------------------------------------------------------- embedding / rerank
     def compute_embedding(self, text: str, abort=None) -> list:
