@@ -35,52 +35,31 @@ from .plugin_common import (
 # 现在只剩一个提交口 `kb_queue`、一个注入口 `handle_llm_request`。
 
 
-# heading_path 的层级分隔符。新数据用不可见字符（见 hermes_kb/chunker.py 的
-# PATH_SEP），老数据仍是 " > "。**标题本身可能含 " > "**，所以老数据存在误切，
-# 重建索引后自然消失。
-_PATH_SEP = "\x1f"
+# heading_path 的层级怎么拆，规则只有一份：`hermes_kb/heading.py`。
+# 这里不复制实现 —— 但也不能模块级导入 hermes_kb：它的 __init__ 会拉
+# KBEngine（numpy/sqlite 一堆重库），实测把插件加载从 0.05s 拖到 7s。
+# 所以首次用到时延迟导入一次，之后走缓存。
+_split_heading_path = None
+_split_ready = False
 
 
 def _path_parts(heading_path) -> List[str]:
-    """把 heading_path 拆成层级数组。
-
-    新数据用不可见分隔符，拆开就是层级，零歧义。老数据是 ``" > "`` 拼的，
-    而**标题本身也可能含 " > "** —— 例如「输出上限超出上游模型限制
-    （64000 > 32768）」会被切成两段，卡标题只剩「…（64000」。
-
-    所以老格式拆完还要过一次 ``_rebalance``：靠括号是否闭合把误切的两半合回去。
-    括号平衡是确定性信号，不是猜 —— 正常切开的老数据每段本来就平衡，不会被合。
-    """
+    """``heading_path`` → 层级数组。实现在 ``hermes_kb/heading.py``。"""
+    global _split_heading_path, _split_ready
+    if not _split_ready:
+        try:
+            from hermes_kb.heading import split_heading_path as _f
+            _split_heading_path = _f
+        except Exception:                          # 极端兜底：宁可不切，不切错
+            logger.warning(
+                "[KBAutoInject] hermes_kb.heading 不可用，heading_path 按单层处理"
+            )
+            _split_heading_path = None
+        _split_ready = True
     hp = str(heading_path or "")
-    if not hp:
-        return []
-    if _PATH_SEP in hp:
-        return [x.strip() for x in hp.split(_PATH_SEP) if x.strip()]
-    return _rebalance([x.strip() for x in hp.split(" > ") if x.strip()])
-
-
-_OPEN = "（([【《"
-_CLOSE = "）)]】》"
-
-
-def _rebalance(parts: List[str]) -> List[str]:
-    """把被标题内容里的 " > " 误切开的片段合回去。
-
-    判据只有一条：括号没闭合。逐段累加，直到开闭括号数配平才算一段结束。
-    正常切分的每段天然平衡，所以这个函数对它们是恒等的。
-    """
-    out: List[str] = []
-    buf = ""
-    for p in parts:
-        buf = f"{buf} > {p}" if buf else p
-        opens = sum(buf.count(c) for c in _OPEN)
-        closes = sum(buf.count(c) for c in _CLOSE)
-        if opens <= closes:
-            out.append(buf)
-            buf = ""
-    if buf:                       # 末尾仍未配平：原样带上，不丢内容
-        out.append(buf)
-    return out
+    if _split_heading_path is None:
+        return [hp] if hp else []
+    return _split_heading_path(hp)
 
 
 class KBAutoInjectPlugin:

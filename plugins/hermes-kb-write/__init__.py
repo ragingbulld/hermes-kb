@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
-from typing import Any
+from typing import Any, List
 
 logger = logging.getLogger("hermes_kb_write")
 
@@ -236,6 +236,37 @@ def _slugify(text: str, limit: int = 60) -> str:
     return (s[:limit] or "reflection").strip("_")
 
 
+# heading_path 的拆分规则只有一份：`hermes_kb/heading.py`。这里不复制实现，
+# 也不在模块级导入 hermes_kb —— 它的 __init__ 会拉 KBEngine（numpy/sqlite），
+# 把插件加载从 0.05s 拖到 7s。首次用到时延迟导入一次，之后走缓存。
+_split_heading_path = None
+_split_ready = False
+
+
+def _hp_parts(heading_path: str) -> List[str]:
+    """``heading_path`` → 层级数组。实现在 ``hermes_kb/heading.py``。"""
+    global _split_heading_path, _split_ready
+    if not _split_ready:
+        try:
+            from hermes_kb.heading import split_heading_path as _f
+            _split_heading_path = _f
+        except Exception:
+            try:
+                _ensure_hermes_kb_importable()
+                from hermes_kb.heading import split_heading_path as _f
+                _split_heading_path = _f
+            except Exception:
+                logger.warning(
+                    "[kb-write] hermes_kb.heading 不可用，heading_path 按单层处理"
+                )
+                _split_heading_path = None
+        _split_ready = True
+    hp = str(heading_path or "")
+    if _split_heading_path is None:
+        return [hp] if hp else []
+    return _split_heading_path(hp)
+
+
 def _card_title_from_heading_path(heading_path: str, real_path: str = "") -> str:
     """候选块所属**卡片**的 H1 标题。
 
@@ -250,8 +281,8 @@ def _card_title_from_heading_path(heading_path: str, real_path: str = "") -> str
     回填给 ``delete_reflection_card`` 的 ``confirm_title``，而删卡校验读的是文件 H1，
     两者口径不能分叉；这里只服务于判重/追加，用块自己那张卡的 H1 更准。
     """
-    hp = str(heading_path or "").strip()
-    h1 = re.split(r"\s+>\s+", hp)[0].strip() if hp else ""
+    _parts = _hp_parts(heading_path)
+    h1 = _parts[0] if _parts else ""
     h1 = re.sub(r"\s*\(Part \d+\)+$", "", h1).strip()
     if len(h1) <= 8 and real_path:
         h1 = _card_title_from_file(real_path)
@@ -267,10 +298,7 @@ def _section_from_heading_path(heading_path: str, card_title: str = "") -> str:
     返回空串让调用方省略该字段，提示里说明「命中在整卡正文」。旧实现直接回填检索的
     ``title`` 列，对这种块会印出「title 与 section 一模一样、都带 Part 2」的噪声。
     """
-    hp = str(heading_path or "").strip()
-    if not hp:
-        return ""
-    parts = [p.strip() for p in re.split(r"\s+>\s+", hp) if p.strip()]
+    parts = _hp_parts(heading_path)
     if not parts:
         return ""
     sec = re.sub(r"\s*\(Part \d+\)+$", "", parts[-1]).strip()

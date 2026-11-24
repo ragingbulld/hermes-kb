@@ -3,11 +3,7 @@ import os
 import re
 
 
-# 标题层级的分隔符。**不能用 " > "** —— 标题本身就可能含它，例如
-# 「输出上限超出上游模型限制（64000 > 32768）」会被下游拆成两级，卡标题
-# 只剩「…（64000」。\x1f 是 ASCII 单元分隔符，正文里不可能出现，拿它拼
-# 层级不存在歧义；显示侧照旧渲染成 " > "。
-PATH_SEP = "\x1f"
+from .heading import PATH_SEP, deepest, join_heading_path
 
 
 class MarkdownChunker:
@@ -38,7 +34,7 @@ class MarkdownChunker:
             if chunk_text:
                 sections.append({
                     "heading_path": self._build_path_str(current_headings),
-                    "title": self._deepest(current_headings),
+                    "title": deepest(current_headings),
                     "content": chunk_text,
                 })
 
@@ -147,25 +143,13 @@ class MarkdownChunker:
         non_empty = [line.strip() for line in text.splitlines() if line.strip()]
         return bool(non_empty) and all(heading_pattern.match(line) for line in non_empty)
 
-    @staticmethod
-    def _deepest(headings_dict) -> str:
-        """末级标题（最深层那一级）。
-
-        **不能用 `heading_path.split(" > ")[-1]` 反推**：标题本身可能含 `" > "`
-        —— 例如 `… 输出上限超出上游模型限制（64000 > 32768）`，反推会切成
-        `32768）`。层级信息在这里是全的（level → text），直接取最深一级即可。
-        """
-        if not headings_dict:
-            return ""
-        return str(headings_dict[max(headings_dict)]).strip()
-
     def _build_path_str(self, headings_dict):
         crumbs = []
         for level in sorted(headings_dict):
             value = str(headings_dict[level]).strip()
             if value and (not crumbs or crumbs[-1] != value):
                 crumbs.append(value)
-        return PATH_SEP.join(crumbs) if crumbs else "知识库文档"
+        return join_heading_path(crumbs)
 
     def _make_chunk(self, file_path, heading_path, content, index, part_index=0, title=""):
         vector_text = f"【路径】{heading_path}\n\n{content}"
