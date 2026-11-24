@@ -159,10 +159,14 @@ class KBAutoInjectPlugin:
         ``title`` ≤8 字，是「症状」「避坑铁律」「根因」「LEGAL」这种东西），拿它当
         卡片标题等于没给。``heading_path`` 全库 0 条缺失，第一段就是卡片 H1。
         """
-        # 走 _path_parts 而不是 re.split(" > ")：标题本身可能含 " > "，
-        # 例如「…模型限制（64000 > 32768）」会被割成「…（64000」。
-        _parts = _path_parts(chunk.get("heading_path"))
-        h1 = _parts[0] if _parts else ""
+        # 首选 chunk 自带的一级标题：切分时原样带出，零猜测。
+        # 老数据没有这一列，才回退到从 heading_path 反推 —— 反推在 H1 自身
+        # 含 " > " 时必错（「…（64000 > 32768）」会被割成「…（64000」，
+        # 而「…用 " > " 拼层级…」这种引号场景连括号平衡也救不回来）。
+        h1 = str(chunk.get("h1") or "").strip()
+        if not h1:
+            _parts = _path_parts(chunk.get("heading_path"))
+            h1 = _parts[0] if _parts else ""
         # 长卡切段时 H1 会被写成 "…(Part 1)/(Part 2)"，剥掉，否则同一张卡看着像三张
         h1 = re.sub(r"(?:\s*\(Part \d+\))+$", "", h1).strip()
         if len(h1) <= 8:

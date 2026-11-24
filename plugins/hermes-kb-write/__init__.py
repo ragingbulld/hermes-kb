@@ -267,7 +267,9 @@ def _hp_parts(heading_path: str) -> List[str]:
     return _split_heading_path(hp)
 
 
-def _card_title_from_heading_path(heading_path: str, real_path: str = "") -> str:
+def _card_title_from_heading_path(
+    heading_path: str, real_path: str = "", h1: str = ""
+) -> str:
     """候选块所属**卡片**的 H1 标题。
 
     检索结果的 ``title`` 列是块所在的最深层小节名（``避坑铁律`` / ``次生影响`` /
@@ -281,8 +283,10 @@ def _card_title_from_heading_path(heading_path: str, real_path: str = "") -> str
     回填给 ``delete_reflection_card`` 的 ``confirm_title``，而删卡校验读的是文件 H1，
     两者口径不能分叉；这里只服务于判重/追加，用块自己那张卡的 H1 更准。
     """
-    _parts = _hp_parts(heading_path)
-    h1 = _parts[0] if _parts else ""
+    # 首选调用方给的 h1（chunks 表新列，切分时原样带出）。
+    if not str(h1 or "").strip():
+        _parts = _hp_parts(heading_path)
+        h1 = _parts[0] if _parts else ""
     h1 = re.sub(r"\s*\(Part \d+\)+$", "", h1).strip()
     if len(h1) <= 8 and real_path:
         h1 = _card_title_from_file(real_path)
@@ -390,17 +394,26 @@ def _dedup_check(title: str, body: str) -> tuple[bool, list[dict], str]:
                 # title = 卡片 H1（heading_path 第一段），section = 命中的那一小节。
                 # 只给 title 列（小节名）会让判重变成「靠猜」——模型看到候选叫
                 # 「3. 取标题的现役代码」，既判不了同不同题，也做不了 insert 前的同域核对。
-                "title": _card_title_from_heading_path(r.get("heading_path") or "", fp),
+                "title": _card_title_from_heading_path(
+                    r.get("heading_path") or "", fp, r.get("h1") or ""
+                ),
                 # section = 命中处最深那一小节；命中在卡片级正文（卡里没有小节）时留空，
                 # 免得标题被复读一遍（旧实现回填 title 列，就是「title 与 section 同句」的来源）。
-                "section": _section_from_heading_path(r.get("heading_path") or "", _card_title_from_heading_path(r.get("heading_path") or "", fp)),
+                "section": _section_from_heading_path(
+                    r.get("heading_path") or "",
+                    _card_title_from_heading_path(
+                        r.get("heading_path") or "", fp, r.get("h1") or ""
+                    ),
+                ),
                 "snippet": " ".join(str(r.get("content") or "").split())[:DUP_SNIPPET_CHARS],
             }
             continue
         # 片段固定取「语义最贴的那块」（rerank 最高），名次用「RRF 最好的那块」。
         if score > cur["score"]:
             cur["score"] = round(score, 4)
-            cur["title"] = _card_title_from_heading_path(r.get("heading_path") or "", fp)
+            cur["title"] = _card_title_from_heading_path(
+                r.get("heading_path") or "", fp, r.get("h1") or ""
+            )
             cur["section"] = _section_from_heading_path(
                 r.get("heading_path") or "", cur["title"]
             )

@@ -35,6 +35,9 @@ class MarkdownChunker:
                 sections.append({
                     "heading_path": self._build_path_str(current_headings),
                     "title": deepest(current_headings),
+                    # 一级标题（文档 H1）。单层时它等于 title，但存下来是为了
+                    # 下游不必从 heading_path 反推 —— 反推在 H1 含 " > " 时必错。
+                    "h1": current_headings.get(1) or current_headings.get(0) or "",
                     "content": chunk_text,
                 })
 
@@ -71,6 +74,7 @@ class MarkdownChunker:
             sections.append({
                 "heading_path": raw_doc_title,
                 "title": raw_doc_title,
+                "h1": raw_doc_title,
                 "content": content.strip(),
             })
 
@@ -97,6 +101,7 @@ class MarkdownChunker:
                 bounded_sections.append({
                     "heading_path": sec["heading_path"],
                     "title": sec.get("title", ""),
+                    "h1": sec.get("h1", ""),
                     "part_index": sub_idx + 1 if len(sub_chunks) > 1 else 0,
                     "content": sub_text,
                 })
@@ -133,6 +138,7 @@ class MarkdownChunker:
                 self._make_chunk(
                     file_path, sec["heading_path"], sec["content"], idx,
                     sec.get("part_index") or 0, sec.get("title") or "",
+                    sec.get("h1") or "",
                 )
             )
         return final_chunks
@@ -151,7 +157,8 @@ class MarkdownChunker:
                 crumbs.append(value)
         return join_heading_path(crumbs)
 
-    def _make_chunk(self, file_path, heading_path, content, index, part_index=0, title=""):
+    def _make_chunk(self, file_path, heading_path, content, index,
+                    part_index=0, title="", h1=""):
         vector_text = f"【路径】{heading_path}\n\n{content}"
         chunk_id = hashlib.md5(
             f"{file_path}::{index}::{content[:50]}".encode("utf-8")
@@ -163,6 +170,9 @@ class MarkdownChunker:
             # 末级小节名。由切分时直接给出，不从上层的 heading_path 反推
             # （标题里可能含 " > "，反推必有损）。
             "title": title or "",
+            # 文档一级标题。下游展示卡标题直接用它，不再从 heading_path 反推
+            # （标题自身含 " > " 时反推必错，见「（64000 > 32768）」那次）。
+            "h1": h1 or "",
             # 同一节被切成多片时的序号（1 起），整节一块则为 0。
             # 它是「位置」不是章节名：不进 heading_path，也不进向量文本。
             "part_index": int(part_index or 0),

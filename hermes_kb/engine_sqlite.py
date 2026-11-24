@@ -36,6 +36,11 @@ from .config import get_config
 
 logger = logging.getLogger(__name__)
 
+# 重试上限：同步路径（CLI / 显式工具）和异步池路径共用这一个数。
+# 以前异步池是「不限次数、只有 cancel 才停」，上游真挂住时任务会一直转，
+# 占着池位不放 —— 加上限后它自己会收手，不用等下次提交来挤。
+MAX_ATTEMPTS = 5
+
 
 class AbortSlot:
     """一次检索的中断句柄：把阻塞在读上的 HTTP 请求当场掐断。
@@ -53,12 +58,11 @@ class AbortSlot:
 
     __slots__ = ("_lock", "_sock", "_cancelled", "_budget", "_used")
 
-    def __init__(self, max_attempts: int | None = None) -> None:
+    def __init__(self, max_attempts: int | None = MAX_ATTEMPTS) -> None:
         self._lock = threading.Lock()
         self._sock = None
         self._cancelled = False
-        # None = 不限次数（异步池路径）：只要没人喊停，就一直试。
-        # 同步路径（CLI / 显式工具）传一个数字，否则上游真挂了会永远转。
+        # 默认 MAX_ATTEMPTS 次；显式传 None 才是不限次数（只有探针需要）。
         self._budget = max_attempts
         self._used = 0
 
@@ -70,12 +74,10 @@ class AbortSlot:
     def stopped(self) -> bool:
         """还要不要再试。**唯一判据**，调用方只看这一处。
 
-        * ``cancelled`` —— 调用方不要了，socket 已经掐断；
-        * 额度用尽     —— 只有同步路径（``max_attempts`` 非 None）才会发生。
+        * ``cancelled`` —— 调用方不要了 / 池位不够被挤掉，socket 已掐断；
+        * 额度用尽     —— 试满 ``max_attempts`` 次还没成，自己收手。
 
-        异步池里的 slot 没有额度，唯一的出口就是 ``cancel()`` —— 而 ``cancel``
-        只发生在池位不够的时候。换句话说：**旧的跑多久都行，只有新的要位置时
-        才让位**，不需要「这一轮翻篇了」这种额外的收工条件。
+        两个出口都保留：池位淘汰负责「让位」，额度负责「别无限转」。
         """
         if self._cancelled:
             return True
@@ -130,12 +132,9 @@ def _shutdown_socket(sock) -> bool:
 
 # 同步路径（CLI、显式工具调用）的重试兜底。异步池不传 abort 时也会落到这里 ——
 # 但池里每个任务都带自己的 slot（无额度），所以正常检索永远走「不限次数」。
-_SYNC_ATTEMPTS = 3
-
-
 def _slot(abort):
     """没传 slot 就造一个带额度的：同步路径上没人会来喊停。"""
-    return abort or AbortSlot(_SYNC_ATTEMPTS)
+    return abort or AbortSlot()
 
 
 class _VectorStore:
@@ -336,7 +335,8 @@ class KBEngine:
                     vector        BLOB NOT NULL,
                     updated_at    REAL NOT NULL,
                     text_hash     TEXT,
-                    part_index    INTEGER DEFAULT 0
+                    part_index    INTEGER DEFAULT 0,
+                    h1            TEXT DEFAULT ''
                 )
                 """
             )
@@ -349,6 +349,13 @@ class KBEngine:
             if "text_hash" not in existing_cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN text_hash TEXT")
                 logger.info("[KBEngine] migrated chunks: added text_hash column")
+            if "h1" not in existing_cols:
+                # 文档一级标题，切分时原样带出。老数据为空 —— 下游回退到从
+                # heading_path 反推，而反推在「标题自身含 " > "」时必错。
+                conn.execute(
+                    "ALTER TABLE chunks ADD COLUMN h1 TEXT DEFAULT ''"
+                )
+                logger.info("[KBEngine] migrated chunks: added h1 column")
             if "part_index" not in existing_cols:
                 # 同一节被切成多片时的序号（1 起），整节一块记 0。
                 # 以前靠把 " (Part N)" 拼进 heading_path 表达，污染了标题；
@@ -656,7 +663,7 @@ class KBEngine:
 
         12 批并行共用一个计数器会互相偷额度 —— 谁先失败谁把别人的次数吃掉。
         所以批次用尽自己的次数不算失败，而是降级到 ``compute_embedding`` 逐条取，
-        那条路不限次数。这里的 ``_SYNC_ATTEMPTS`` 只是「什么时候别再整批试」。
+        那条路不限次数。这里的 ``MAX_ATTEMPTS`` 只是「什么时候别再整批试」。
         """
         if not texts:
             return []
@@ -776,7 +783,7 @@ class KBEngine:
 
         异步池传进来的 slot 没有额度，只要没人喊停就一直试，唯一的出口是池位
         不够时的 ``cancel()``。同步路径（CLI、显式工具）不传，这里补一个
-        ``_SYNC_ATTEMPTS`` 兜底 —— 那种场景没有人会来喊停，上游真挂了必须自己收手。
+        ``MAX_ATTEMPTS`` 兜底 —— 那种场景没有人会来喊停，上游真挂了必须自己收手。
         """
         if not documents:
             return []
@@ -921,6 +928,9 @@ class KBEngine:
                 title = c.get("title") or (
                     heading.split(" > ")[-1] if " > " in heading else heading
                 )
+                # 一级标题：切分时原样带出，不从 heading_path 反推
+                # （标题自身含 " > " 时反推必错）。
+                h1_title = c.get("h1", "") or ""
                 content = c.get("content", "") or ""
                 token_estimate = int(
                     c.get("char_count", len(content)) / 2
@@ -930,8 +940,8 @@ class KBEngine:
                     """
                     INSERT INTO chunks
                         (chunk_id, file_path, heading_path, title, content,
-                         token_estimate, vector, updated_at, part_index)
-                    VALUES (?,?,?,?,?,?,?,?,?)
+                         token_estimate, vector, updated_at, part_index, h1)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(chunk_id) DO UPDATE SET
                         content=excluded.content,
                         heading_path=excluded.heading_path,
@@ -939,7 +949,8 @@ class KBEngine:
                         token_estimate=excluded.token_estimate,
                         vector=excluded.vector,
                         updated_at=excluded.updated_at,
-                        part_index=excluded.part_index
+                        part_index=excluded.part_index,
+                        h1=excluded.h1
                     """,
                     (
                         chunk_id,
@@ -951,6 +962,7 @@ class KBEngine:
                         vec_blob,
                         now,
                         int(c.get("part_index") or 0),
+                        h1_title,
                     ),
                 )
                 row_id = cur.lastrowid
@@ -1181,6 +1193,9 @@ class KBEngine:
                 title = c.get("title") or (
                     heading.split(" > ")[-1] if " > " in heading else heading
                 )
+                # 一级标题：切分时原样带出，不从 heading_path 反推
+                # （标题自身含 " > " 时反推必错）。
+                h1_title = c.get("h1", "") or ""
                 content = c.get("content", "") or ""
                 token_estimate = int(c.get("char_count", len(content)) / 2)
                 text_hash = self._text_key(self._chunk_text(c))
@@ -1188,8 +1203,8 @@ class KBEngine:
                     """
                     INSERT INTO chunks
                         (chunk_id, file_path, heading_path, title, content,
-                         token_estimate, vector, updated_at, text_hash, part_index)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                         token_estimate, vector, updated_at, text_hash, part_index, h1)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(chunk_id) DO UPDATE SET
                         file_path=excluded.file_path,
                         content=excluded.content,
@@ -1199,12 +1214,13 @@ class KBEngine:
                         vector=excluded.vector,
                         updated_at=excluded.updated_at,
                         text_hash=excluded.text_hash,
-                        part_index=excluded.part_index
+                        part_index=excluded.part_index,
+                        h1=excluded.h1
                     """,
                     (
                         chunk_id, file_path, heading, title, content,
                         token_estimate, np.asarray(v, dtype=np.float32).tobytes(), now,
-                        text_hash, int(c.get("part_index") or 0),
+                        text_hash, int(c.get("part_index") or 0), h1_title,
                     ),
                 )
                 row_id = cur.lastrowid
@@ -1353,7 +1369,8 @@ class KBEngine:
 
     # ------------------------------------------------------------------ 检索
     def _row_to_item(self, row):
-        _, chunk_id, fpath, heading, title, content, tok, updated, part_index = row
+        (_, chunk_id, fpath, heading, title, content,
+         tok, updated, part_index, h1) = row
         return {
             "id": str(chunk_id),
             "chunk_id": chunk_id,
@@ -1366,6 +1383,8 @@ class KBEngine:
             # 同一节被切成多片时的序号（1 起），整节一块为 0。
             # 老数据没有这个信息，一律 0 —— 不用「在标题里找 Part」去反推。
             "part_index": int(part_index or 0),
+            # 一级标题：新数据由 chunker 带出；老数据为空，下游回退反推。
+            "h1": h1 or "",
         }
 
     def search(
@@ -1447,7 +1466,7 @@ class KBEngine:
                         rows = {
                             r[0]: r
                             for r in conn.execute(
-                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index FROM chunks WHERE id IN ({ph})",
+                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index, h1 FROM chunks WHERE id IN ({ph})",
                                 hit_ids,
                             )
                         }
@@ -1509,7 +1528,7 @@ class KBEngine:
                         rows = {
                             r[0]: r
                             for r in conn.execute(
-                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index FROM chunks WHERE id IN ({ph})",
+                                f"SELECT id, chunk_id, file_path, heading_path, title, content, token_estimate, updated_at, part_index, h1 FROM chunks WHERE id IN ({ph})",
                                 hit_ids,
                             )
                         }
