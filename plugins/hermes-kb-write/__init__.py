@@ -1020,7 +1020,7 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
         if base in _recent_writes:
             _recent_writes[base] = {"title": card_title, "path": p1, "ts": time.time()}
 
-        _clean_card = _smart_truncate(_clean_card_title_for_receipt(card_title or base), 28)
+        _clean_card = _smart_truncate(_clean_card_title_for_receipt(card_title or base), RECEIPT_TITLE_MAX)
         _clean_sec = _smart_truncate(st, 26)
         receipt = f"已补充《{_clean_card}》· {_clean_sec}"
         if SOP_RECEIPT_ENABLED and not _in_review_fork_thread():
@@ -1652,6 +1652,83 @@ def _publish_sop_summary(agent: Any, actions: list) -> None:
     _enqueue_receipt(msg, origin=origin, sid=sid)
 
 
+_RECEIPT_ATOM_RE = re.compile(
+    r"(?:已沉淀反思卡|已新建反思卡|已修改反思卡|已删除反思卡|已删除卡内片段|已补充)"
+    r"《([^》]+)》"
+    r"(?:\s*·\s*((?!(?:已沉淀|已新建|已修改|已删除|已补充))[^·《》]*\S))?"
+)
+
+_KIND_LABEL = {
+    "已沉淀反思卡": "新建",
+    "已新建反思卡": "新建",
+    "已修改反思卡": "修改",
+    "已补充": "补充",
+    "已删除反思卡": "删除整卡",
+    "已删除卡内片段": "删除片段",
+}
+
+
+def _render_receipt_digest(receipts: list) -> str:
+    """把本轮多条写卡回执渲染成按卡片聚合的 markdown 摘要。
+
+    平铺形态（`· <原文>`）有两个毛病：① 同一张卡改两次就出现两条几乎同名的行；
+    ② SOP 汇总那条会把多条塞进一行（`A · B · C`），一眼看不出改了哪张卡。
+
+    这里先拆成原子条目 → 去重 → 按卡片聚合：一张卡一个加粗标题，下面挂它的
+    每条动作（补充带小节名）。复述行因此被自然吸收，计数也回到真实处数。
+    """
+    prefix = (SOP_RECEIPT_PREFIX or "").strip()
+    order: list = []
+    grouped: dict = {}
+    seen: set = set()
+    leftovers: list = []
+    for msg in receipts:
+        text = msg
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        hit = False
+        for m in _RECEIPT_ATOM_RE.finditer(text):
+            raw = m.group(0)
+            verb = next((v for v in _KIND_LABEL if raw.startswith(v)), "")
+            card = (m.group(1) or "").strip()
+            sec = (m.group(2) or "").strip().rstrip("·").strip()
+            # 回溯会让 `·` 后面的下一个动作词被当成小节（`《A》 · 已补充《B》`），
+            # 负向前瞻挡不住（`\s*` 可回溯成 0 个空格），这里做后置校验。
+            if sec.startswith(("已沉淀", "已新建", "已修改", "已删除", "已补充")):
+                sec = ""
+            if not card:
+                continue
+            hit = True          # 解析出原子即置位，避免整条被复述去重后掉进兜底
+            key = (card, verb, sec)
+            if key in seen:
+                continue
+            seen.add(key)
+            if card not in grouped:
+                grouped[card] = []
+                order.append(card)
+            grouped[card].append((_KIND_LABEL.get(verb, verb), sec))
+        if not hit and text.strip():
+            key = ("", text.strip(), "")
+            if key not in seen:
+                seen.add(key)
+                leftovers.append(text.strip())
+
+    total = sum(len(v) for v in grouped.values()) + len(leftovers)
+    if not order and not leftovers:
+        return "\n".join(f"· {m}" for m in receipts)
+
+    lines = [f"📚 **知识库本轮更新 · {total} 处**"]
+    for card in order:
+        lines.append("")
+        lines.append(f"**《{card}》**")
+        for verb, sec in grouped[card]:
+            lines.append(f"- {verb}「{sec}」" if sec else f"- {verb}")
+    for text in leftovers:
+        lines.append("")
+        lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
 def _drain_pending_receipts(agent: Any) -> None:
     """冲刷积压的 SOP 回执 —— 必须在**同步的** turn 收尾里调用。
 
@@ -1720,7 +1797,10 @@ def _drain_pending_receipts(agent: Any) -> None:
         return
     logger.info("[KBWrite] 冲刷本聊天回执 %d 条（chat=%s）", len(mine), me or "unknown")
     cb = getattr(agent, "background_review_callback", None)
-    for msg in mine:
+    # 一轮里写几张卡就刷几条「已补充」，实测一次例行维护能连发 10 条，用户看到的是
+    # 通知淹没正文。多条合并成一条按卡片聚合的摘要：反馈还在，但只占一条位置。
+    batch = [_render_receipt_digest(mine)] if len(mine) > 1 else mine
+    for msg in batch:
         with suppress(Exception):
             agent._safe_print(msg)
         if cb:
