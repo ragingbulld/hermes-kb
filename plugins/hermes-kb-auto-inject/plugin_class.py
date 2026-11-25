@@ -69,6 +69,19 @@ def _path_parts(heading_path) -> List[str]:
 class KBAutoInjectPlugin:
     """Execution-state-driven knowledge base retriever and API-bound injector."""
 
+    # 单次请求最多合并几批清单（一个检索任务 = 一批）。
+    # 只限**批**，不限批内的卡：阈值仍是唯一质量闸（injection-gate-rules §7.5）。
+    # 为什么是 2：早批对应的工具调用已经跑完，下文生成只缺最近动作的坐标；
+    # 实测一轮峰值 3 批 / 8.5k 字符，2 批足够覆盖「用户原话 + 当前动作」。
+    # **超出的是排队，不是丢弃** —— 剩下的留在槽里等下一个请求，不设字符预算。
+    _MAX_MERGED_MENUS = 2
+    # 待投递槽的**容量硬上限**（槽里最多压几批，不含本次投出去的）。
+    # 只有一个作用：防无界积压。每轮投 2 批、实测新进 1.47 批/轮，
+    # 常态槽深度 ≤ 2，摸不到这条线；真摸到了就是连续多轮进 3 批以上，
+    # 那时旧批已经和当前动作脱节，丢掉比拖着更有价值。
+    # **不看积压深度改投递顺序** —— 永远只投提示词里最新的 2 批。
+    _MAX_PENDING_SLOTS = 6
+
     def __init__(self):
         # 类型注解用 Any：KBEngine 已改为惰性导入，运行时不再求值该符号
         self._engine: Optional[Any] = None
@@ -78,10 +91,12 @@ class KBAutoInjectPlugin:
         self._turns: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._max_turn_states = 128
         # ---------------- 全部状态：一次待投递的清单 ----------------
-        # sid -> [清单文本, ...]。检索跑完由后台线程 `_on_job_done` 追加，
-        # 下一次模型请求前由 `handle_llm_request` **一次取空**。
+        # sid -> [(提交序号, 检索词, 清单文本), ...]。检索跑完由后台线程
+        # `_on_job_done` 追加，下一次模型请求前由 `handle_llm_request` 取走。
+        # 带检索词是为了出口能回查它在**当前提示词**里的位置 —— 服务端排新的
+        # 依据是「提示词里最靠后」，既不认完成时间，也不认提交序号（并行段乱序）。
         # 不记「印过哪张卡」、不扫历史比对、不按词查重 —— 去重整套删掉了（owner 2026-11-24 定案）。
-        self._pending: Dict[str, List[str]] = {}
+        self._pending: Dict[str, List[Tuple[int, str, str]]] = {}
         self._pending_lock = threading.Lock()
         # kb_query 的后台检索池：只跑 retrieve（慢的网络段）。**跑完当场回调**
         # `_on_job_done` 把清单塞进待投递槽 —— 池子里没有「等人来取」的成品。
@@ -887,20 +902,59 @@ class KBAutoInjectPlugin:
 
     # ============ 唯一出口：检索跑完攒起来，下次请求贴进副本 ============
 
+    def _prompt_rank(self, request: Dict[str, Any], query: str) -> int:
+        """这条检索词在**当前提示词**里的位置，越大越新。
+
+        为什么不按提交序号（``seq``）排：Hermes 的只读工具批次是**并行**
+        执行的，并行段里 ``next(seq)`` 的先后取决于线程调度，既不等于
+        ``tool_calls`` 数组顺序，也不等于提示词顺序。完成时间更不行 ——
+        跑得快的旧批会冒充新的。
+        所以直接从请求里从后往前找它最后一次出现的位置。
+
+        找不到（上一轮留下、已被压缩）返回 -1，按旧批处理。
+        """
+        needle = query[:40]
+        if not needle:
+            return -1
+        msgs = request.get("messages") or request.get("input") or []
+        for back, msg in enumerate(reversed(msgs[-40:])):
+            if not isinstance(msg, dict):
+                continue
+            for tc in reversed(msg.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                args = (tc.get("function") or {}).get("arguments")
+                if isinstance(args, str) and needle in args:
+                    return 1_000_000 - back
+            if msg.get("role") == "user":
+                text = _content_text(msg.get("content"))
+                if text and needle in text:
+                    return 1_000_000 - back
+        return -1
+
     def _on_job_done(
-        self, session_id: str, query: str, chunks: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        seq: int,
     ) -> None:
         """检索完成的这一刻：清单进待投递槽。后台线程调用。
 
         不做判断、不查历史、不比对 —— 印出来就排队等着，下一次模型请求
         由 `handle_llm_request` 取走贴进请求副本（不进 state.db）。
+
+        ``seq`` 是池子的**提交**序号（不是完成序）：出口排序时的兜底键。
+        **必填，不给默认值** —— 漏传时若默认成 0，这批会被排到最前当成
+        「最旧的」直接丢掉，而且静默无日志。宁可当场 TypeError。
+        真正的「新旧」由 ``handle_llm_request`` 用检索词在提示词里的位置判定。
         """
         _sid = session_id or "default"
         _menu = self._menu_from_chunks(query, chunks)
         if not _menu:
             return
         with self._pending_lock:
-            self._pending.setdefault(_sid, []).append(_menu)
+            self._pending.setdefault(_sid, []).append((seq, query, _menu))
         logger.info(
             "[KBAutoInject] pending MENU chars=%d q=%s sid=%s",
             len(_menu), _short(query, 60), _sid[:26],
@@ -920,15 +974,33 @@ class KBAutoInjectPlugin:
             return None
         _sid = session_id or "default"
         with self._pending_lock:
-            _menus = self._pending.pop(_sid, [])
-        if not _menus:
-            return None
-        _block = "\n\n".join(_menus)
+            _slot = self._pending.get(_sid)
+            if not _slot:
+                return None
+            # 按「检索词在提示词里的位置」排，位置相同再按提交序号兜底。
+            # 不按完成时间、也不单独按提交序号：并行段里两者都会错位。
+            _slot.sort(key=lambda item: (self._prompt_rank(request, item[1]), item[0]))
+            # 容量闸：只在超过硬上限时从**最旧**一端删，防无界积压。
+            # 这里不参与「投谁」的决策 —— 投递顺序永远只看新鲜度。
+            _dropped = 0
+            if len(_slot) > self._MAX_PENDING_SLOTS:
+                _dropped = len(_slot) - self._MAX_PENDING_SLOTS
+                del _slot[:_dropped]
+            # 永远投提示词里最新的 N 批，与积压深度无关。
+            _take = _slot[-self._MAX_MERGED_MENUS:]
+            del _slot[-self._MAX_MERGED_MENUS:]
+            _queued = len(_slot)
+            if not _slot:
+                self._pending.pop(_sid, None)
+        _block = "\n\n".join(text for _, _, text in _take)
         if not _append_to_last_message(request, _block):
+            # 没拼进去就放回槽，下次还有机会 —— 注入失败不等于这批数据作废。
+            with self._pending_lock:
+                self._pending.setdefault(_sid, []).extend(_take)
             return None
         logger.info(
-            "[KBAutoInject] llm_request INJECT batches=%d chars=%d sid=%s",
-            len(_menus), len(_block), _sid[:26],
+            "[KBAutoInject] llm_request INJECT batches=%d chars=%d queued=%d dropped=%d sid=%s",
+            len(_take), len(_block), _queued, _dropped, _sid[:26],
         )
         return {
             "request": request,

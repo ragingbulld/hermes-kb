@@ -28,8 +28,8 @@
 每个任务带一个 ``AbortSlot``，engine 收到后把 ``conn.sock`` 登记进去，
 ``cancel()`` 一调，阻塞中的 ``getresponse()`` 立刻抛，线程当场空出来。
 
-生命周期：跑完就投递 —— ``retrieve`` 一返回，池子当场调 ``on_done(session_id, query, chunks)``，
-由插件把清单写进会话历史，然后把这条任务从池里删掉。**不存在「等人来取」的中间态**，
+生命周期：跑完就投递 —— ``retrieve`` 一返回，池子当场调 ``on_done(session_id, query, chunks, seq)``，
+``seq`` 是提交序号，插件用它决定「哪几批最新」；清单进待投递槽，然后这条任务从池里删掉。**不存在「等人来取」的中间态**，
 因此也没有 TTL、没有代数、没有取件口（2026-11-24 owner 定案：检索完成即注入历史）。
 池子现在只负责两件事：别让同一个词重复查（inflight），池位满时掐最旧的（``_make_room_locked``）。
 """
@@ -65,7 +65,7 @@ class KBAsyncPool:
     def __init__(
         self,
         retrieve: Callable[[str], List[Dict[str, Any]]],
-        on_done: Optional[Callable[[str, str, List[Dict[str, Any]]], None]] = None,
+        on_done: Optional[Callable[[str, str, List[Dict[str, Any]], int], None]] = None,
         max_workers: int = 8,
     ) -> None:
         self._retrieve = retrieve
@@ -228,7 +228,7 @@ class KBAsyncPool:
         )
         if chunks and self._on_done is not None:
             try:
-                self._on_done(key[0], query, chunks)
+                self._on_done(key[0], query, chunks, seq)
             except Exception as exc:         # noqa: BLE001 — 投递失败不能拖垮线程池
                 logger.warning(
                     "[KBAutoInject] on_done failed q=%s: %s", _short(query, 60), exc
