@@ -636,11 +636,21 @@ DELETE_REFLECTION_SCHEMA = {
 }
 
 
+_TITLE_TAG_RE = re.compile(r"^\[(?:排障SOP|经验|工具链路|规约SOP|[\s/])+\]\s*")
+
+
 def _clean_card_title_for_receipt(raw: str) -> str:
-    """清洗卡片标题用于人面回执：去除 [经验 / 工具链路] 等中括号分类前缀。"""
+    """清洗卡片标题用于人面回执：剥掉**所有** [经验 / 工具链路] 等中括号分类前缀。
+
+    旧实现只 sub 一次，而重复前缀真的存在（H1 里照抄了两层分类），回执里就顶着
+    双层前缀。循环剥到稳定为止。
+    """
     t = str(raw or "").strip()
-    t = re.sub(r"^\[(?:排障SOP|经验|工具链路|规约SOP|[\s/])+\]\s*", "", t).strip()
-    return t or raw
+    while True:
+        stripped = _TITLE_TAG_RE.sub("", t).strip()
+        if stripped == t:
+            return t or raw
+        t = stripped
 
 
 def _smart_truncate(text: str, max_len: int = 32) -> str:
@@ -657,6 +667,65 @@ def _smart_truncate(text: str, max_len: int = 32) -> str:
     if last_open_quote != -1 and "”" not in sub[last_open_quote:]:
         return sub[:last_open_quote].rstrip(" ，,：:、") + "…"
     return sub.rstrip(" ，,：:、") + "…"
+
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.M)
+
+
+def _plain_label(text: str) -> str:
+    """把一段 markdown 洗成一行人话：去标题 / 列表 / 强调 / 行内代码 / 链接记号。"""
+    t = str(text or "").strip()
+    t = re.sub(r"^#{1,6}[ \t]*", "", t)
+    t = re.sub(r"^(?:[-*+]|\d+[.)])[ \t]+", "", t)
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)   # 链接/图片 → 保留文字
+    t = re.sub(r"[`*_~]{1,}", "", t)                   # 强调/代码记号
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def _describe_edit_target(card_text: str, old: str, new: str) -> str:
+    """给 replace/delete 回执一个「改在哪儿」的短标签，口径对齐 insert 的小节名。
+
+    优先取改动落点所属的标题行（`## 修正 2026-11-26：…`），取不到就退到改动
+    片段首行。**只给定位，不回显内容** —— 回执是一行摘要，不是 diff。
+    """
+    idx = card_text.find(old) if old else -1
+    label = ""
+    if idx >= 0:
+        heads = [m for m in _HEADING_LINE_RE.finditer(card_text) if m.start() <= idx]
+        if heads:
+            label = heads[-1].group(2)
+    if not label:
+        for line in (new or old).splitlines():
+            if _plain_label(line):
+                label = line
+                break
+    label = _plain_label(label)
+    return _smart_truncate(label, RECEIPT_TITLE_MAX) if label else ""
+
+
+def _card_anchor(card_md: str) -> str:
+    """新建回执的「定位」：卡内第一个二级标题；没有就退到 H1 之后第一段实质正文。
+
+    用途与 `_describe_edit_target` 对称 —— 回执统一回答「这张卡的哪一处」。
+    新建时最自然的锚点就是它从哪一节开始说，而不是再复述一遍 H1（卡名已经
+    在上一行了）。元信息行（`- **记录时间**：`、`tags: [...]`）不算正文。
+    """
+    md = str(card_md or "")
+    for m in _HEADING_LINE_RE.finditer(md):
+        if len(m.group(1)) >= 2:                      # 只认 ## 及以下
+            return _smart_truncate(_plain_label(m.group(2)), RECEIPT_TITLE_MAX)
+    started = False
+    for line in md.splitlines():
+        s = line.strip()
+        if not started:
+            started = s.startswith("# ")
+            continue
+        if not s or s.startswith("tags:") or re.match(r"^-\s*\*\*.+?\*\*[：:]", s):
+            continue
+        s = _plain_label(s)
+        if s:
+            return _smart_truncate(s, RECEIPT_TITLE_MAX)
+    return ""
 
 
 def _card_title_from_file(p: str) -> str:
@@ -1084,11 +1153,16 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
     title = _card_title_from_file(p1)
     if base in _recent_writes:
         _recent_writes[base] = {"title": title, "path": p1, "ts": time.time()}
-    logger.info("[KBWrite] edit(%s): %s (%s -> %s B, md5 %s -> %s, title=%r)",
-                mode, base, len(txt.encode()), len(data), m1[:8], m3[:8], title)
+    # 先算定位再打日志：`target=` 是**新码独有**的字段，用来判断活进程到底换没换码
+    # （注册行那个 code md5 每 60 秒重算一次，会显示假「新」，不能当判据）。
+    _where = _describe_edit_target(txt, old, new)
+    logger.info("[KBWrite] edit(%s): %s (%s -> %s B, md5 %s -> %s, title=%r, target=%r)",
+                mode, base, len(txt.encode()), len(data), m1[:8], m3[:8], title, _where)
 
     _short = _smart_truncate(_clean_card_title_for_receipt(title), RECEIPT_TITLE_MAX)
     receipt = f"已修改反思卡《{_short}》" if mode == "replace" else f"已删除卡内片段《{_short}》"
+    if _where:
+        receipt += f" · {_where}"
     if SOP_RECEIPT_ENABLED and not _in_review_fork_thread():
         _enqueue_receipt_for_kw(f"{SOP_RECEIPT_PREFIX}{receipt}", kw)
     return json.dumps({
@@ -1096,6 +1170,7 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
         "mode": mode,
         "path": p1,
         "card_title": title,
+        "target": _where,
         "md5_before": m1,
         "md5_after": m3,
         "bytes_before": len(txt.encode()),
@@ -1320,7 +1395,10 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
     # display.review.summary_callback 自动加，这里只放正文。
     # 路径 / md5 / 查重 / 索引等细节留在工具返回的其它字段里，不进群消息。
     _short = _smart_truncate(_clean_card_title_for_receipt(title), RECEIPT_TITLE_MAX)
+    _anchor = _card_anchor(card)
     receipt = f"已沉淀反思卡《{_short}》"
+    if _anchor:
+        receipt += f" · {_anchor}"
     # 主 AI 自己写的卡**同样要回执**：handler 在**主 turn 内**同步执行，入队后
     # 由 finalize_turn 包装器的 _drain_pending_receipts 在**同一轮**收尾冲刷 →
     # 与主回复同批投递，不必等下一轮（也就绕开了 fork 那条 generation 门控）。
@@ -1668,6 +1746,12 @@ _KIND_LABEL = {
 }
 
 
+def _nest_quote(label: str) -> str:
+    """标签自身已含「」时换成『』，避免和外面那层引号同级嵌套、看着像断句。"""
+    s = str(label or "")
+    return s.replace("「", "『").replace("」", "』") if ("「" in s or "」" in s) else s
+
+
 def _render_receipt_digest(receipts: list) -> str:
     """把本轮多条写卡回执渲染成按卡片聚合的 markdown 摘要。
 
@@ -1691,10 +1775,16 @@ def _render_receipt_digest(receipts: list) -> str:
             raw = m.group(0)
             verb = next((v for v in _KIND_LABEL if raw.startswith(v)), "")
             card = (m.group(1) or "").strip()
+            # 渲染层再洗一遍卡名：回执可能来自旧进程/旧队列，或 fork 汇总把别处
+            # 的原文照抄进来，不该让双层分类前缀漏到人面上。按洗后的名字聚合，
+            # 同一张卡的不同写法才不会裂成两段。
+            card = _clean_card_title_for_receipt(card)
             sec = (m.group(2) or "").strip().rstrip("·").strip()
-            # 回溯会让 `·` 后面的下一个动作词被当成小节（`《A》 · 已补充《B》`），
-            # 负向前瞻挡不住（`\s*` 可回溯成 0 个空格），这里做后置校验。
-            if sec.startswith(("已沉淀", "已新建", "已修改", "已删除", "已补充")):
+            # 回溯会让 `·` 后面的下一个动作词被当成小节（`《A》 · 已补充《B》`）。
+            # 回溯产物必然是「纯动作词」，所以按全等判定就够；这里原先用
+            # startswith，会顺手把「已补充的两种写法」这类正常小节名清空 ——
+            # 现在 replace/delete 回执也开始带小节名了，必须收紧。
+            if sec in _KIND_LABEL:
                 sec = ""
             if not card:
                 continue
@@ -1722,7 +1812,7 @@ def _render_receipt_digest(receipts: list) -> str:
         lines.append("")
         lines.append(f"**《{card}》**")
         for verb, sec in grouped[card]:
-            lines.append(f"- {verb}「{sec}」" if sec else f"- {verb}")
+            lines.append(f"- {verb}「{_nest_quote(sec)}」" if sec else f"- {verb}")
     for text in leftovers:
         lines.append("")
         lines.append(f"- {text}")
