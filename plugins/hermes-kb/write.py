@@ -1848,16 +1848,24 @@ def _render_receipt_digest(receipts: list) -> str:
 
     total = sum(len(v) for v in grouped.values()) + len(leftovers)
     if not order and not leftovers:
-        return "\n".join(f"· {m}" for m in receipts)
+        # 一条原子都没解析出来 → 回执是自由文本（旧进程/旧队列的原文）。
+        # 原文必须照发，但不能再挂 `· ` 前缀：那会让它看着像下面那种带层级的
+        # 列表项，而实际上没有层级。多条之间空行分开即可。
+        return "\n\n".join(str(m).strip() for m in receipts if str(m).strip())
 
-    lines = [f"📚 **知识库本轮更新 · {total} 处**"]
+    # 版式：一卡一行标题 + 一行动作，卡与卡之间不空行。
+    # 原来是「每动作一行 + 每卡前留空行」，5 处更新就占十几行 —— 手机上一条
+    # 回执顶掉半屏，扫一眼也看不出到底动了几张卡。同一张卡的多条动作并进
+    # 一行用 ` · ` 分隔，卡片这一层才是一行一条。
+    lines = [f"📚 **知识库本轮更新 · {total} 处**", ""]
     for card in order:
-        lines.append("")
         lines.append(f"**《{card}》**")
-        for verb, sec in grouped[card]:
-            lines.append(f"- {verb}「{_nest_quote(sec)}」" if sec else f"- {verb}")
+        acts = " · ".join(
+            (f"{verb}「{_nest_quote(sec)}」" if sec else verb)
+            for verb, sec in grouped[card]
+        )
+        lines.append(f"- {acts}")
     for text in leftovers:
-        lines.append("")
         lines.append(f"- {text}")
     return "\n".join(lines)
 
