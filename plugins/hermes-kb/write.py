@@ -1858,23 +1858,22 @@ def _render_receipt_digest(receipts: list) -> str:
     # 回执顶掉半屏，扫一眼也看不出到底动了几张卡。同一张卡的多条动作并进
     # 一行用 ` · ` 分隔，卡片这一层才是一行一条。
     #
-    # 2026-11-28（二改）：卡名必须自称一个列表项，且卡与卡之间留空行。
-    # 第一版写成 `**《卡A》**` / `- 动作` / `**《卡B》**` / `- 动作`，卡间不空行时
-    # markdown 把 `**《卡B》**` 当成上一个 `- ` 列表项的延续行（lazy continuation），
-    # 实测渲染出来 B、C 全被缩进成 A 的子项（用户截图确认）。
-    # 现在：卡名挂一级 `- `，动作缩进两级；**同时**卡与卡之间保留空行 ——
-    # 万一目标端的 markdown 不支持嵌套列表（QQ NT 的渲染范围没验证过），
-    # 空行也能保证卡名不被并进上一个列表项。行数 11 vs 旧版 13，仍然更短。
+    # 2026-11-28（三改）：卡名不要圆点。前两版卡名都挂在 `- ` 上，渲染出来
+    # 每条卡名前顶一个 `•`，owner 说「标题不要有点啊很丑的」。卡名现在是独立
+    # 段落（裸 `**《…》**`），动作行仍用 `- ` 保留层级感。
+    # 卡与卡之间必须留空行：卡名是段落、动作是列表，紧接着的下一行卡名会被
+    # markdown 判成上一个列表项的延续行（lazy continuation），B、C 就会缩进
+    # 成 A 的子项 —— 这正是上一版踩的坑。
     lines = [f"📚 **知识库本轮更新 · {total} 处**", ""]
     for i, card in enumerate(order):
         if i:
             lines.append("")
-        lines.append(f"- **《{card}》**")
+        lines.append(f"**《{card}》**")
         acts = " · ".join(
             (f"{verb}「{_nest_quote(sec)}」" if sec else verb)
             for verb, sec in grouped[card]
         )
-        lines.append(f"  - {acts}")
+        lines.append(f"- {acts}")
     for text in leftovers:
         lines.append(f"- {text}")
     return "\n".join(lines)
