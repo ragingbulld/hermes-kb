@@ -1853,27 +1853,25 @@ def _render_receipt_digest(receipts: list) -> str:
         # 列表项，而实际上没有层级。多条之间空行分开即可。
         return "\n\n".join(str(m).strip() for m in receipts if str(m).strip())
 
-    # 版式：一卡一行标题 + 一行动作，卡与卡之间不空行。
-    # 原来是「每动作一行 + 每卡前留空行」，5 处更新就占十几行 —— 手机上一条
-    # 回执顶掉半屏，扫一眼也看不出到底动了几张卡。同一张卡的多条动作并进
-    # 一行用 ` · ` 分隔，卡片这一层才是一行一条。
+    # 版式：卡名独立成段，动作一行一条，卡与卡之间空一行。
+    # 最早是「每卡前留空行 + 每动作一行」，5 处更新占十几行 —— 手机上一条
+    # 回执顶掉半屏，扫一眼也看不出动了几张卡。现在卡是一级、动作是叶子。
     #
-    # 2026-11-28（三改）：卡名不要圆点。前两版卡名都挂在 `- ` 上，渲染出来
-    # 每条卡名前顶一个 `•`，owner 说「标题不要有点啊很丑的」。卡名现在是独立
-    # 段落（裸 `**《…》**`），动作行仍用 `- ` 保留层级感。
-    # 卡与卡之间必须留空行：卡名是段落、动作是列表，紧接着的下一行卡名会被
-    # markdown 判成上一个列表项的延续行（lazy continuation），B、C 就会缩进
-    # 成 A 的子项 —— 这正是上一版踩的坑。
+    # 2026-11-28（四改）：卡名独立成段（无圆点），每个动作单独一行。
+    # 三版把同卡多动作用 ` · ` 并成一行，行数是省了，但两个动作名都不短时
+    # 会连成一句「补充「A」· 修改「B」」，读起来像一件事，owner 截图问
+    # 「为啥两个操作显示成一行了」。回执是给人看的，读得快比短重要。
+    # 卡与卡之间仍留空行：卡名是段落、动作是列表，紧接着的下一行卡名会被
+    # markdown 判成上一个列表项的延续行（lazy continuation）。
     lines = [f"📚 **知识库本轮更新 · {total} 处**", ""]
     for i, card in enumerate(order):
         if i:
             lines.append("")
         lines.append(f"**《{card}》**")
-        acts = " · ".join(
-            (f"{verb}「{_nest_quote(sec)}」" if sec else verb)
+        lines.extend(
+            f"- {verb}「{_nest_quote(sec)}」" if sec else f"- {verb}"
             for verb, sec in grouped[card]
         )
-        lines.append(f"- {acts}")
     for text in leftovers:
         lines.append(f"- {text}")
     return "\n".join(lines)
