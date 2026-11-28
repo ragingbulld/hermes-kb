@@ -44,9 +44,11 @@ raise SystemExit(0 if r else 1)
 " 2>/dev/null; then ok "search 有结果"; else bad "search 无结果或报错（查 key / base_url / 额度）"; fi
 
 head "3. 注入插件"
-if "$PY" -c "import hermes_kb_auto_inject" 2>/dev/null; then ok "hermes-kb-auto-inject 可导入"
-elif [ -d "$HOME/.hermes/plugins/hermes-kb-auto-inject" ]; then ok "插件目录存在（未 pip 安装，属正常）"
-else bad "注入插件未安装"; fi
+PLUG="$HOME/.hermes/plugins/hermes-kb"
+# 不能判 `import hermes_kb` —— 那是引擎包的名字，引擎装上就恒为真，与插件无关
+if [ -f "$PLUG/inject.py" ] && [ -f "$PLUG/write.py" ]; then ok "hermes-kb 已安装（读侧 inject.py + 写侧 write.py）"
+elif [ -d "$PLUG" ]; then bad "插件目录在，但缺 inject.py / write.py"
+else bad "注入插件未安装（cp -r plugins/hermes-kb ~/.hermes/plugins/）"; fi
 
 head "结果"
 echo "  通过 $pass 项，失败 $fail 项"

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ── hermes_kb 自举：这个插件自己负责把引擎包放到 sys.path 上 ────────────────────
 #
 # 历史（2026-11-06 事故）：`hermes_kb` 住在 $HERMES_HOME/hermes_kb，不在任何
-# site-packages 里，全靠 venv 里一个 `zz-hermes-kb-path.pth`（内容是 Hermes 安装根目录）
+# site-packages 里，全靠 venv 里一个 `zz-hermes-kb-path.pth`（内容 `/root/.hermes`）
 # 进 sys.path。网关是 `python3 -I -c …` 启动的，`-I` 忽略 PYTHONPATH 与 user-site，
 # 所以那个 .pth 是唯一入口。而 .pth 不属任何 pip 包 —— `pm repair / install /
 # update` 每次新建一代 environment 都不会把它带过去，于是「换 generation」这件事
@@ -162,7 +162,7 @@ def scan_heads(lines: "List[str]") -> "List[Tuple[int, int, str]]":
 # dispatch 前要从入参里剥掉的键。第一个是本插件自己的元参数；
 # 后三个是旧 doing 协议的字段（协议已删，检索词只走 kb_query），**但不能跟着删**：
 # 旧会话仍可续用，其历史里 assistant 的 tool_call 带着这些键，模型会照着续写，
-# 裸传给底层工具就是「未知参数」报错。实测 `$HERMES_HOME/sessions/` 里仍有 12 份
+# 裸传给底层工具就是「未知参数」报错。实测 /root/.hermes/sessions/ 里仍有 12 份
 # 请求转储带 `"doing":` 键（2026-08-27 ~ 09-28 的长会话）。剥离成本只是一次元组
 # 成员判断，留着是保险，不是尸体。
 _STRIP_KEYS = (KB_FIELD, "doing", "execution_state", "_hermes_execution")

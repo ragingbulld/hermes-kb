@@ -144,7 +144,7 @@ curl -s "$HERMES_KB_RERANK_BASE_URL" \
 
 ### 写卡查重依赖重排
 
-如果 `use_reranker: false`，`hermes-kb-write` 的查重会**静默失效**（不报错，只是不再拦截重复卡）。要么开重排，要么别用写卡功能。
+如果 `use_reranker: false`，`hermes-kb` 写侧的查重会**静默失效**（不报错，只是不再拦截重复卡）。要么开重排，要么别用写卡功能。
 
 ---
 
@@ -155,21 +155,23 @@ curl -s "$HERMES_KB_RERANK_BASE_URL" \
 ### 怎么确认插件加载了
 
 ```bash
-journalctl -u hermes-gateway -n 300 --no-pager | grep -i "KBAutoInject"
+grep -a "KBAutoInject" ~/.hermes/logs/agent.log | tail -5
 ```
 
-**必须有这一行：**
+**必须有这一行**（插件日志落在 `agent.log`，不在 gateway 的 journal 里 —— 去 journal 里 grep 是稳定假阴性，重载明明成功也一个字没有）：
 
 ```
-hermes-kb-auto-inject code md5=abc123def456 (1234 行, 7 个模块) registered — ...
+hermes-kb code md5=abc123def456 (5391 行, 10 个模块) registered — 成功=['inject', 'write'] 失败=无
 ```
+
+三个数一起看：md5 是内容指纹，行数与模块数是「拼进去的文件集合」。**模块数对不上 = 装的是别的版本**，不是这一版。摘要里的 `成功=['inject', 'write']` 是两段注册的结果，只出现一个说明另一段抛了 —— 往上翻 `[hermes-kb] 读侧注册失败` / `写侧注册失败`。
 
 ### 没有这一行 → 逐项排查
 
 | 检查 | 命令 |
 |---|---|
-| 插件目录在、名字对 | `ls ~/.hermes/plugins/hermes-kb-auto-inject/` |
-| `plugin.yaml` 可读 | `cat ~/.hermes/plugins/hermes-kb-auto-inject/plugin.yaml` |
+| 插件目录在、名字对 | `ls ~/.hermes/plugins/hermes-kb/` |
+| `plugin.yaml` 可读 | `cat ~/.hermes/plugins/hermes-kb/plugin.yaml` |
 | 在 `config.yaml` 里 enable 了 | `grep -A5 'plugins:' ~/.hermes/config.yaml` |
 | Python 依赖装在**当前 venv** | `systemctl cat hermes-gateway \| grep ExecStart` 看用的是哪个 python，然后 `<那个python> -c "import watchdog"` |
 | 没有语法错误 | `<那个python> -c "import ast; ast.parse(open('.../__init__.py').read())"` |
@@ -457,11 +459,11 @@ import sys, os, importlib.util, pathlib
 sys.path.insert(0, "/path/to/hermes-kb-opensource")   # 换成你的路径
 os.environ["HERMES_KB_CONFIG"] = "/path/to/config.json"
 
-pkg = pathlib.Path("/path/to/hermes-kb-opensource/plugins/hermes-kb-auto-inject")
+pkg = pathlib.Path("/path/to/hermes-kb-opensource/plugins/hermes-kb")
 spec = importlib.util.spec_from_file_location(
-    "hermes_kb_auto_inject", pkg/"__init__.py",
+    "hermes_kb", pkg/"__init__.py",
     submodule_search_locations=[str(pkg)])
-m = importlib.util.module_from_spec(spec); sys.modules["hermes_kb_auto_inject"] = m
+m = importlib.util.module_from_spec(spec); sys.modules["hermes_kb"] = m
 spec.loader.exec_module(m)
 
 out = m.plugin_instance.handle_pre_llm_call(

@@ -383,54 +383,71 @@ journalctl -u hermes-kb -n 20 --no-pager
 ### 8.1 复制插件
 
 ```bash
-cp -r plugins/hermes-kb-auto-inject ~/.hermes/plugins/
-cp -r plugins/hermes-kb-write ~/.hermes/plugins/     # 可选：写卡功能
+cp -r plugins/hermes-kb ~/.hermes/plugins/
 ```
+
+一个目录就是一个插件，里面是两段：`inject.py`（读侧，注入清单 + `kb_query` 门禁）和 `write.py`（写侧，`save_reflection` / `edit_reflection_card` / `delete_reflection_card`）。两段各自注册、各包 `try/except` —— 写侧崩了不影响注入，注入崩了也不影响写卡。
+
+> 早先是两个插件（`hermes-kb-auto-inject` + `hermes-kb-write`），写卡标「可选」。**合并后无法只装读侧**：三个写卡工具会一起注册。不想要每轮的收尾分叉就置 `KB_WRITE_SOP_FORK=0`，工具留着不用即可。
 
 ### 8.2 在 config.yaml 里启用
 
 ```yaml
 plugins:
   enabled:
-    - hermes-kb-auto-inject
-    # - hermes-kb-write      # 要写卡才开
+    - hermes-kb
   entries:
-    hermes-kb-auto-inject:
+    hermes-kb:
       allow_tool_override: false
 ```
 
-### 8.3 重启网关
+### 8.3 让插件生效
+
+首次装载得让进程起来：
 
 ```bash
 systemctl restart hermes-gateway    # 或你实际的进程名
 ```
 
-> ⚠️ **必须重启进程，不是 reload 配置。** 钩子只在进程启动那一刻注册一次，热重载配置不会重新注册 `pre_llm_call`。这是最常见的「装了没生效」原因。
+之后**改插件代码不必重启**，走网关控制口热重载：
+
+```bash
+PYTHONPATH=/usr/local/lib/hermes-agent /usr/local/lib/hermes-agent/venv/bin/python -c "
+from pathlib import Path
+from gateway.control_socket import reload_gateway_plugins
+print(reload_gateway_plugins(Path.home() / '.hermes'))"
+```
+
+返回体里 `reloaded: True` 加 `activations[].name` 出现 `hermes-kb`，只说明「重新 exec 了这个模块并跑了 register」，**不说明钩子真装上了**。插件自己的注册日志落在 `~/.hermes/logs/agent.log`，不在 gateway 的 journal 里 —— 去 journal 里 grep 是稳定假阴性。
+
+> ⚠️ `systemctl reload`（SIGHUP）与插件热重载是两件事：前者不重新注册 `pre_llm_call`，后者会重新 exec 插件模块并重跑 `register()`。**验收永远是「真调一次工具看返回」**，不是看 PID 变没变、也不是看有没有 `code md5=` 那一行。
 
 ### 8.4 验收：注入真的发生了
 
 ```bash
-journalctl -u hermes-gateway -n 200 --no-pager | grep -i "KBAutoInject"
+grep -a "KBAutoInject" ~/.hermes/logs/agent.log | tail -5
 ```
 
-日志里应该有 `code md5=... registered` 这样的行。**但这一行不能证明注入真的在工作**——它只证明模块被导入了。
+日志里应该有 `... registered` 这样的行。**但这一行不能证明注入真的在工作**——它只证明模块被导入了。
 
-> ⚠️ **`code md5=` 这个判据会骗人。** 任何日志里同时出现 `code md5=` 和 `hermes-kb-auto-inject` 的文本（包括你自己 grep 时把这段教程贴进终端）都能让它变绿。真判据只有下面这条。
+> ⚠️ **`code md5=` 这个判据会骗人。** 任何日志里同时出现 `code md5=` 和 `hermes-kb` 的文本（包括你自己 grep 时把这段教程贴进终端）都能让它变绿。真判据只有下面这条。
 
 **真判据：直调 `handle_pre_llm_call`，看返回值里有没有 `<knowledge-base-titles>`。**
 
 ```python
 import sys, os, importlib.util, pathlib
-sys.path.insert(0, os.path.expanduser("~/.hermes"))       # 让 hermes_kb 可导入
+sys.path.insert(0, os.path.expanduser("~/.hermes"))       # 让引擎包 hermes_kb 可导入
 
-pkg = pathlib.Path(os.path.expanduser("~/.hermes/plugins/hermes-kb-auto-inject"))
+pkg = pathlib.Path(os.path.expanduser("~/.hermes/plugins/hermes-kb"))
+# 模块名不能叫 "hermes_kb" —— 那是引擎包的名字，会把 sys.modules 里那份覆盖掉
 spec = importlib.util.spec_from_file_location(
-    "hermes_kb_auto_inject", pkg/"__init__.py",
+    "hermes_kb_plugin", pkg / "__init__.py",
     submodule_search_locations=[str(pkg)])
-m = importlib.util.module_from_spec(spec); sys.modules["hermes_kb_auto_inject"] = m
+m = importlib.util.module_from_spec(spec); sys.modules["hermes_kb_plugin"] = m
 spec.loader.exec_module(m)
 
-out = m.plugin_instance.handle_pre_llm_call(
+from hermes_kb_plugin.inject import plugin_instance      # 读侧实例在子模块里
+out = plugin_instance.handle_pre_llm_call(
     session_id="install-check",
     messages=[{"role": "user", "content": "写一句你库里肯定有的关键词"}],
 )

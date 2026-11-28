@@ -10,7 +10,7 @@
 
 环境变量:
     HERMES_KB_CONFIG      配置文件路径
-    HERMES_KB_PLUGIN_DIR  插件目录（默认 ~/.hermes/plugins/hermes-kb-auto-inject）
+    HERMES_KB_PLUGIN_DIR  插件目录（默认 ~/.hermes/plugins/hermes-kb）
 """
 import importlib.util
 import os
@@ -26,11 +26,11 @@ def load_plugin(plugin_dir: pathlib.Path):
         sys.exit(f"❌ 插件入口不存在: {init}")
 
     spec = importlib.util.spec_from_file_location(
-        "hermes_kb_auto_inject", init,
+        "hermes_kb", init,
         submodule_search_locations=[str(plugin_dir)],
     )
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["hermes_kb_auto_inject"] = mod
+    sys.modules["hermes_kb"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -40,7 +40,7 @@ def main() -> int:
 
     plugin_dir = pathlib.Path(os.environ.get(
         "HERMES_KB_PLUGIN_DIR",
-        os.path.expanduser("~/.hermes/plugins/hermes-kb-auto-inject"),
+        os.path.expanduser("~/.hermes/plugins/hermes-kb"),
     ))
     print(f"插件目录 : {plugin_dir}")
     print(f"检索词   : {query}")

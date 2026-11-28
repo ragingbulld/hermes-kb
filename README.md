@@ -112,8 +112,10 @@ hermes-kb/
 │   └── config.py                配置加载（密钥从环境变量读）
 │
 ├── plugins/
-│   ├── hermes-kb-auto-inject/   注入插件：pre_llm_call 注入清单 + kb_query 门禁
-│   └── hermes-kb-write/         写卡插件：查重 + H1 硬闸 + 落盘
+│   └── hermes-kb/               一个插件，两段各自注册（互不牵连）
+│       ├── inject.py            读侧：pre_llm_call 注入清单 + kb_query 门禁
+│       ├── write.py             写侧：查重 + H1 硬闸 + 落盘
+│       └── plugin.yaml          两段合并后的 hooks / tools 声明
 │
 ├── config/
 │   └── config.example.json      全配置模板（密钥留空）
@@ -145,7 +147,7 @@ hermes-kb/
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | 从零安装：依赖、配置、建库、起服务、装插件、验收 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 引擎怎么工作：分块策略、双索引、RRF、注入链路 |
-| [docs/CARD-FORMAT.md](docs/CARD-FORMAT.md) | 卡片格式规范（写卡插件按这个校验） |
+| [docs/CARD-FORMAT.md](docs/CARD-FORMAT.md) | 卡片格式规范（`hermes-kb` 写侧按这个校验） |
 | [docs/TUNING.md](docs/TUNING.md) | 调参：阈值怎么标、换模型后怎么重标、注入预算 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 五个真实陷阱：注入静默失效、api_key 被空串顶掉、懒加载误判、FTS 表名、验收脚本自去重 |
 | [scripts/healthcheck.sh](scripts/healthcheck.sh) | 一键体检：库/向量/FTS/检索/插件，五关 |

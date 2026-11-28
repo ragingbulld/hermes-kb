@@ -1,0 +1,26 @@
+name: hermes-kb
+version: 1.0.0
+description: "本地知识库（读写一体）：读侧每轮自动检索注入 + 写侧反思卡 save/edit/delete"
+author: "Hermes"
+entrypoint: "__init__.py"
+enabled: true
+# 合并自 hermes-kb-auto-inject（读）+ hermes-kb-write（写）。两段注册互相隔离，
+# 但没有拆回去的打算之前，别在 register 之外把它们重新耦起来。
+provides_hooks:
+  - pre_llm_call
+  - transform_tool_result
+provides_middleware:
+  - llm_request
+provides_tools:
+  - search_knowledge
+  - save_reflection
+  - edit_reflection_card
+  - delete_reflection_card
+# 官方 PM 会在构建插件运行环境时安装这些依赖（pyproject [project].dependencies 的
+# manifest 等价写法）。必须声明：依赖装在各 environment 的独立 venv 里，Hermes
+# 更新换环境时会丢，届时插件在网关启动那一刻加载失败，而钩子只在进程启动时注册
+# 一次 —— 结果就是注入静默归零（2026-09-30 事故）。
+python_dependencies:
+  - 'watchdog>=6,<7'
+  - 'numpy>=2,<3'
+  - 'requests>=2.32,<3'

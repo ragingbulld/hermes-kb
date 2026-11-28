@@ -6,13 +6,12 @@
      让主AI自己判断是「追加修正节」还是「force 重写」。查重不靠模型自觉 —— 写在
      handler 里，可外部复核。
   3. 双根落盘 + md5 一致校验（KB 规约：reflections/ 卡片双根）。
-     **部分部署里双根是同一实体**：inbox 根是 local 根的符号链接（路径由
-     `REFLECTIONS_INBOX_DIR` / `LOCAL_KB_REFLECTIONS_DIR` 决定，可用环境变量覆盖）。
-     此时物理上只有一份卡，双根语义保留（两个路径都能写、都能读、都走同一套越界
-     校验），但「两份副本会静默漂移」这个结构性隐患被消灭。下面的写入/改卡/删卡
-     逻辑因此必须按「同实体」去重：同一 inode 不重复写、不重复 remove，否则第二次
-     remove 会抛 ENOENT 并被记成一个假的 failed 记录（删除本身已成功，但回执看起来
-     像失败了）。
+     **2026-11-05 起双根是同一实体**：`/srv/hermes-kb-inbox/reflections` 是指向
+     `/root/knowledge_base/reflections` 的符号链接。物理上只有一份卡，双根语义保留
+     （两个路径都能写、都能读、都走同一套越界校验），但「两份副本会静默漂移」这个
+     结构性隐患被消灭。下面的写入/改卡/删卡逻辑因此必须按「同实体」去重：
+     同一 inode 不重复写、不重复 remove，否则第二次 remove 会抛 ENOENT 并被记成
+     一个假的 failed 记录（删除本身已成功，但回执看起来像失败了）。
   4. 回执照内置记忆工具 tool result 形态，主AI 收到后自然转述。
 
 为什么查重的判据是「语义检索」而不是字符串相似度:
@@ -52,13 +51,13 @@ TOOL_EMOJI = {
 }
 
 # ── KB 规约路径（与 hermes-kb-reflection 保持一致，双根镜像） ──────────────────
-# 双根落盘目录。两个根都写同一份卡（md5 一致），索引只建一份。
-# 用环境变量覆盖，不写死：KB_REFLECTIONS_INBOX_DIR / KB_REFLECTIONS_LOCAL_DIR
+# 开源仓库版：路径不写死，由部署方用环境变量指定。生产环境里两处可指向同一个
+# inode（一个根是另一个的软链，2026-11-05 起双根同实体）。
 REFLECTIONS_INBOX_DIR = os.environ.get(
     "KB_REFLECTIONS_INBOX_DIR", os.path.expanduser("~/hermes-kb-inbox/reflections")
 )
 LOCAL_KB_REFLECTIONS_DIR = os.environ.get(
-    "KB_REFLECTIONS_LOCAL_DIR", os.path.expanduser("~/knowledge_base/reflections")
+    "KB_REFLECTIONS_LOCAL_DIR", os.path.expanduser("~/hermes-kb-inbox/reflections")
 )
 
 # ── 查重阈值 ──────────────────────────────────────────────────────────────────
@@ -220,8 +219,8 @@ def _get_engine():
         return _engine
     try:
         _ensure_hermes_kb_importable()
-        # 进程级单例：检索侧拿到的也是这一个实例，写入时 _append_vectors
-        # 更新的内存索引检索侧立刻可见。
+        # 进程级单例：检索侧（hermes-kb-auto-inject）拿到的也是这一个实例，
+        # 写入时 _append_vectors 更新的内存索引检索侧立刻可见。
         from hermes_kb.engine import get_engine
         _engine = get_engine()
         logger.info("[KBWrite] KBEngine ready for dedup gate")
@@ -460,9 +459,8 @@ def _dedup_check(title: str, body: str) -> tuple[bool, list[dict], str]:
 def _distinct_roots(filename: str) -> list[str]:
     """返回该 filename 在双根下**物理上互不相同**的路径列表。
 
-    部分部署里 inbox 根是 local 根的符号链接（具体路径见
-    `REFLECTIONS_INBOX_DIR` / `LOCAL_KB_REFLECTIONS_DIR`），两个路径指向同一个 inode。
-    此时只应写/删一次：对同一 inode 做第二次
+    2026-11-05 起 `/srv/hermes-kb-inbox/reflections` 是 `/root/knowledge_base/reflections`
+    的符号链接，两个路径指向同一个 inode。此时只应写/删一次：对同一 inode 做第二次
     `os.remove()` 会抛 ENOENT，在回执里表现为「删除失败」，而实际上删除已经成功。
     """
     out: list[str] = []
@@ -642,8 +640,8 @@ _TITLE_TAG_RE = re.compile(r"^\[(?:排障SOP|经验|工具链路|规约SOP|[\s/]
 def _clean_card_title_for_receipt(raw: str) -> str:
     """清洗卡片标题用于人面回执：剥掉**所有** [经验 / 工具链路] 等中括号分类前缀。
 
-    旧实现只 sub 一次，而重复前缀真的存在（H1 里照抄了两层分类），回执里就顶着
-    双层前缀。循环剥到稳定为止。
+    旧实现只 sub 一次，而重复前缀真的存在（`[排障SOP] [排障SOP] ai.gitee.com…`
+    是 H1 里照抄了两层分类），回执里就顶着双层前缀。循环剥到稳定为止。
     """
     t = str(raw or "").strip()
     while True:
@@ -653,32 +651,76 @@ def _clean_card_title_for_receipt(raw: str) -> str:
         t = stripped
 
 
+_SOFT_BREAK_TOKENS = ("：", ":", " · ", "——", "—", "；", ";", "|", "｜", "，", ",", "、", " ")
+
+
 def _smart_truncate(text: str, max_len: int = 32) -> str:
-    """智能截断短语：超长截断并补省略号，智能避免留下悬空的「或“等开括号。"""
+    """按语义边界收缩短语，**不硬切句子**。
+
+    2026-11-26 改造（用户反馈回执里出现「…导出为中文 P…」这种把 `PDF` 剁成
+    `P` 的断法）：旧实现只在「未闭合引号/括号」上做让步，其余一律按字符位硬切，
+    结果切点常落在英文词或主谓中间。现在的顺位是：
+
+    1. ``max_len <= 0`` → 不截，原样返回（回执里的卡名走这条）。
+    2. 找标点断点，优先级 冒号 > 中点/破折号 > 分号 > 竖线 > 逗号/顿号 > 空格；
+       断点位置须 >= ``max_len * 0.35``，否则宁可继续往下走，不为一个靠前的
+       标点把标题砍成半截。
+    3. 仍无断点 → 回退未闭合的「或“（保留旧行为）。
+    4. 最后才硬切，但**不切英文单词/数字串**（`PDF` 整体保留或整体后移）。
+
+    截断时省略号占一个字符位，所以结果恒 <= ``max_len``。
+    """
     s = str(text or "").strip()
-    if len(s) <= max_len:
+    if max_len <= 0 or len(s) <= max_len:
         return s
-    sub = s[:max_len - 1]
+    window = s[:max_len]
+    floor = max(int(max_len * 0.35), 1)
+    for tok in _SOFT_BREAK_TOKENS:
+        p = window.rfind(tok)
+        if p >= floor:
+            return window[:p].rstrip(" ，,：:、·—-｜|") + "…"
     # 若截断处恰好处于未闭合的「或“内部，做优雅回退防破裂
-    last_open_cn = sub.rfind("「")
-    if last_open_cn != -1 and "」" not in sub[last_open_cn:]:
-        return sub[:last_open_cn].rstrip(" ，,：:、") + "…"
-    last_open_quote = sub.rfind("“")
-    if last_open_quote != -1 and "”" not in sub[last_open_quote:]:
-        return sub[:last_open_quote].rstrip(" ，,：:、") + "…"
-    return sub.rstrip(" ，,：:、") + "…"
+    last_open_cn = window.rfind("「")
+    if last_open_cn != -1 and "」" not in window[last_open_cn:]:
+        return window[:last_open_cn].rstrip(" ，,：:、") + "…"
+    last_open_quote = window.rfind("“")
+    if last_open_quote != -1 and "”" not in window[last_open_quote:]:
+        return window[:last_open_quote].rstrip(" ，,：:、") + "…"
+    # 硬切前的最后让步：别把 ASCII 单词/数字串拦腰砍断。
+    # 只在能退到真正的词边界、且不至于损失太多（不低于窗口一半）时才采用。
+    cut = max_len
+    limit = max(floor, int(max_len * 0.5))
+    if (cut < len(s)
+            and window[cut - 1].isascii() and window[cut - 1].isalnum()
+            and s[cut].isascii() and s[cut].isalnum()):
+        probe = cut
+        while probe > limit and s[probe - 1].isascii() and s[probe - 1].isalnum():
+            probe -= 1
+        if probe > limit:
+            cut = probe
+    return window[:cut].rstrip(" ，,：:、·—-｜|") + "…"
 
 
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.M)
 
 
 def _plain_label(text: str) -> str:
-    """把一段 markdown 洗成一行人话：去标题 / 列表 / 强调 / 行内代码 / 链接记号。"""
+    """把一段 markdown 洗成一行人话：去标题 / 列表 / 强调 / 行内代码 / 链接记号。
+
+    2026-11-26：强调记号改成**只剥成对的那几个**。旧实现 `[`*_~]{1,}` 一刀切，
+    会把英文标识符里的下划线也吃掉（`RECEIPT_TITLE_MAX` → `RECEIPTTITLEMAX`），
+    回执里看着像打错字。现在 `*`/`_`/`~` 只在成对出现时才当记号。
+    """
     t = str(text or "").strip()
     t = re.sub(r"^#{1,6}[ \t]*", "", t)
     t = re.sub(r"^(?:[-*+]|\d+[.)])[ \t]+", "", t)
     t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)   # 链接/图片 → 保留文字
-    t = re.sub(r"[`*_~]{1,}", "", t)                   # 强调/代码记号
+    t = re.sub(r"`([^`]*)`", r"\1", t)                 # 行内代码：去反引号留内容
+    # 只剥**成对的粗体/删除线**。单 `_` 不能碰：`RECEIPT_TITLE_MAX` 里正好两个
+    # 下划线，按对儿剥就变成 `RECEIPTTITLEMAX`，回执里像打错字。
+    for mark in ("**", "__", "~~"):
+        if t.count(mark) >= 2:
+            t = re.sub(re.escape(mark) + r"(.+?)" + re.escape(mark), r"\1", t)
     return re.sub(r"[ \t]+", " ", t).strip()
 
 
@@ -829,8 +871,8 @@ def _index_path_variants(p: str) -> list[str]:
     """同一张卡在索引里可能出现的所有 file_path 写法。
 
     `delete_by_file_path()` 是**字面精确匹配**（`WHERE file_path = ?`），而索引键来自
-    watcher 扫描时的路径字面。双根为同一实体后，卡可能以 local 根或 inbox 根
-    任一种写法入索引；只删其中一种会静默留下另一半脏切片。
+    watcher 扫描时的路径字面。双根为同一实体后，卡可能以 `/root/...` 或
+    `/srv/hermes-kb-inbox/...` 任一种写法入索引；只删其中一种会静默留下另一半脏切片。
     """
     base = os.path.basename(p)
     out: list[str] = []
@@ -970,7 +1012,8 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
     2026-10-07 owner 指令「简化工具，只留新建、删除、修改」：把 append_to_reflection 与
     find_reflection_card 两条独立工具并入本 handler 的 mode 分支。
 
-    SOP 收尾复查与主线程使用同样的精确匹配和路径保护；其他受限后台线程仍只读/追加。
+    SOP 收尾复查与主线程使用同样的精确匹配和路径保护；2026-11-25 起
+    所有后台线程的 replace/delete 权限也一视同仁（此前只有 kb-sop-fork 有）。
     """
     mode = str(args.get("mode") or "").strip().lower()
     if mode not in ("find", "insert", "replace", "delete"):
@@ -991,17 +1034,18 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
             ensure_ascii=False,
         )
 
-    # 仅本插件的 SOP 收尾复查获得维护权限，原生 bg-review 等其他受限线程保持原边界。
-    if (mode in ("replace", "delete") and _thread_tool_restricted()
-            and threading.current_thread().name != "kb-sop-fork"):
-        return json.dumps({
-            "success": False,
-            "error": (
-                f"此受限后台线程无权 mode={mode}：它会改到卡里已有正文。"
-                "后台只允许 mode=find 与 mode=insert。"
-            ),
-            "hint": "请由主 AI 或本插件的 SOP 收尾复查发起。",
-        }, ensure_ascii=False)
+    # 2026-11-25 owner 指令「后台给所有权限」：删掉按线程名分权的门。
+    # 原来只有 kb-sop-fork 能做 replace/delete，其他受限线程只能 insert ——
+    # 于是「发现原文写错了」只能再追加一节「修正」，一张卡堆出四五节互相指认
+    # 作废，而原文的错结论永远没人就地改掉（2026-10-18-2039 烂到要自己写一份
+    # 勘误索引，开头就是「先看这张表再决定信谁」）。现在所有后台线程一视同仁，
+    # 安全性靠下面三道既有护栏：只限 reflections 双根 / 双根 md5 必须一致 /
+    # old_string 必须精确且唯一命中。
+    if mode in ("replace", "delete"):
+        logger.info(
+            "[KBWrite] %s by thread=%s path=%s",
+            mode, threading.current_thread().name, args.get("card_path"),
+        )
 
     paths = _resolve_card_paths(args.get("card_path"))
     if not paths:
@@ -1090,7 +1134,7 @@ def edit_reflection_card_handler(args: dict, **kw: Any) -> str:
             _recent_writes[base] = {"title": card_title, "path": p1, "ts": time.time()}
 
         _clean_card = _smart_truncate(_clean_card_title_for_receipt(card_title or base), RECEIPT_TITLE_MAX)
-        _clean_sec = _smart_truncate(st, 26)
+        _clean_sec = _smart_truncate(st, 40)
         receipt = f"已补充《{_clean_card}》· {_clean_sec}"
         if SOP_RECEIPT_ENABLED and not _in_review_fork_thread():
             _enqueue_receipt_for_kw(f"{SOP_RECEIPT_PREFIX}{receipt}", kw)
@@ -1294,7 +1338,6 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
     if not title or not body:
         return json.dumps({"success": False, "error": "title 与 body 均不能为空"}, ensure_ascii=False)
 
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     is_dup, hits, note = _dedup_check(title, body)
 
     if is_dup and not force:
@@ -1377,9 +1420,11 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
     tag_line = ""
     if isinstance(tags, list) and tags:
         tag_line = "tags: [" + ", ".join(str(t) for t in tags) + "]\n"
+    # 卡头不再写「记录时间」：时间已由 `file_records.first_seen` 记着，read_file
+    # 出口的 `kb_card` 会印「记于 …」，正文再抄一遍是冗余 —— 而且手抄的值会跟
+    # 引擎记的对不上。老卡里那一行保留（不参与显示，也不影响它们的时间）。
     card = (
         f"# [{kind}] {title}\n\n"
-        f"- **记录时间 / 生效日期**：{ts} (UTC+8)\n"
         f"{tag_line}"
         f"- **来源**：主AI 收尾反思（hermes-kb-write）\n\n"
         f"{body}\n"
@@ -1405,7 +1450,7 @@ def save_reflection_handler(args: dict, **kw: Any) -> str:
     # fork 线程里不重复入队：那两条链各自的发布器负责。
     if SOP_RECEIPT_ENABLED and not _in_review_fork_thread():
         _enqueue_receipt_for_kw(f"{SOP_RECEIPT_PREFIX}{receipt}", kw)
-        logger.info("[KBWrite] receipt enqueued by main-AI write: %s", receipt)
+        logger.info("[KBWrite] receipt enqueued by main-AI write: %s (anchor=%r)", receipt, _anchor)
     return json.dumps({
         "success": True,
         "staged": False,
@@ -1577,8 +1622,10 @@ SOP_FORK_DRAIN_TICKET = (os.environ.get("KB_WRITE_SOP_FORK_DRAIN_TICKET") or "1"
 # 用「可能丢一张卡」换「重启不会被一张卡绑架」。
 SOP_FORK_DRAIN_BUDGET = float(os.environ.get("KB_WRITE_SOP_FORK_DRAIN_BUDGET") or "45")
 
-# 回执里标题的最大显示长度；超出则截断加省略号（群聊防刷屏，可调）。
-RECEIPT_TITLE_MAX = int(os.environ.get("KB_WRITE_RECEIPT_TITLE_MAX") or "48")
+# 回执里标题的最大显示长度；超出则按语义边界收缩（不硬切英文词，见 _smart_truncate）。
+# 2026-11-26：48 → 96。原来的 48 会把「…导出为中文 PDF：…」剁成「…导出为中文 P…」，
+# 卡名认不出来；多卡汇总是每卡独占一行，放宽不影响刷屏。
+RECEIPT_TITLE_MAX = int(os.environ.get("KB_WRITE_RECEIPT_TITLE_MAX") or "96")
 
 # SOP 回执待发队列：fork 侧只入队，由下一轮 finalize_turn 同步冲刷后才真正投递。
 # （迟到的回执会被网关的 generation 门控静默丢弃，详见 _drain_pending_receipts。）
@@ -1591,9 +1638,7 @@ RECEIPT_TITLE_MAX = int(os.environ.get("KB_WRITE_RECEIPT_TITLE_MAX") or "48")
 _PENDING_RECEIPTS: list = []
 _PENDING_RECEIPTS_LOCK = threading.Lock()
 RECEIPT_QUEUE_TTL = float(os.environ.get("KB_WRITE_RECEIPT_TTL") or "1800")
-STATE_DB_PATH = os.environ.get("KB_WRITE_STATE_DB") or os.path.expanduser(
-    "~/.hermes/state.db"
-)
+STATE_DB_PATH = os.environ.get("KB_WRITE_STATE_DB") or "/root/.hermes/state.db"
 _RECEIPT_CHAT_KEY_CACHE: dict = {}
 
 # SOP 回执前缀。刻意不复用原生 i18n 模板 display.review.summary_callback
@@ -1753,13 +1798,11 @@ def _nest_quote(label: str) -> str:
 
 
 def _render_receipt_digest(receipts: list) -> str:
-    """把本轮多条写卡回执渲染成按卡片聚合的 markdown 摘要。
+    """把本轮多条写卡回执渲染成带层级的 markdown 摘要。
 
-    平铺形态（`· <原文>`）有两个毛病：① 同一张卡改两次就出现两条几乎同名的行；
-    ② SOP 汇总那条会把多条塞进一行（`A · B · C`），一眼看不出改了哪张卡。
-
-    这里先拆成原子条目 → 去重 → 按卡片聚合：一张卡一个加粗标题，下面挂它的
-    每条动作（补充带小节名）。复述行因此被自然吸收，计数也回到真实处数。
+    2026-11-25：原实现是 `· <原文>` 平铺。两个毛病：①同一张卡改两次就出现两条
+    几乎同名的行；② fork 的 SOP 汇总会把多条塞进一行（`A · B · C`），一眼看不出
+    改了哪张卡。这里先拆成原子条目 → 去重 → 按卡片聚合，一张卡一个标题。
     """
     prefix = (SOP_RECEIPT_PREFIX or "").strip()
     order: list = []
@@ -1788,7 +1831,7 @@ def _render_receipt_digest(receipts: list) -> str:
                 sec = ""
             if not card:
                 continue
-            hit = True          # 解析出原子即置位，避免整条被复述去重后掉进兜底
+            hit = True          # 只要这条里解析出原子，就绝不进兜底分支
             key = (card, verb, sec)
             if key in seen:
                 continue
@@ -1887,15 +1930,20 @@ def _drain_pending_receipts(agent: Any) -> None:
         return
     logger.info("[KBWrite] 冲刷本聊天回执 %d 条（chat=%s）", len(mine), me or "unknown")
     cb = getattr(agent, "background_review_callback", None)
-    # 一轮里写几张卡就刷几条「已补充」，实测一次例行维护能连发 10 条，用户看到的是
-    # 通知淹没正文。多条合并成一条按卡片聚合的摘要：反馈还在，但只占一条位置。
-    batch = [_render_receipt_digest(mine)] if len(mine) > 1 else mine
-    for msg in batch:
+    # 2026-11-25：多条合并成一条气泡。一轮里写几张卡就刷几条「已补充」，
+    # 实测一次例行维护能连发 10 条，用户看到的是通知淹没正文。合并成一条带行
+    # 的汇总，反馈还在，但只占一条位置。
+    if len(mine) > 1:
+        # 2026-11-25（二轮）：平铺 `· 原文` 换成按卡片聚合的 markdown 摘要，
+        # 见 _render_receipt_digest 的说明。
+        out = _render_receipt_digest(mine)
+    else:
+        out = mine[0]
+    with suppress(Exception):
+        agent._safe_print(out)
+    if cb:
         with suppress(Exception):
-            agent._safe_print(msg)
-        if cb:
-            with suppress(Exception):
-                cb(msg)
+            cb(out)
 
 
 def _open_drain_ticket(fork_agent: Any) -> None:
@@ -2050,34 +2098,39 @@ def _sop_fork_worker(agent: Any, messages_snapshot: list) -> None:
                 br._release_fork_clients(review_agent)
 
 
-def _has_successful_work_tool_call(messages) -> bool:
-    """Only review turns that completed a non-retrieval tool successfully.
+# ── fork 准入判据（2026-11-25 起两条） ──────────────────────────────────────
+# 1) 本轮主线程已经**成功**写过反思卡 → 不再起 fork。owner 指令原话：「本轮
+#    AI 已经改了卡就不必再启动 fork」。fork 要判断的「该不该沉淀」正是主线程
+#    刚刚亲手判断过的事；它真正值钱的地方是主线程忙别的、忘了沉淀的回合。
+# 2) 否则保持 2026-11-17 的成本门控：本轮要有成功的非只读调用。
+# 两条都只扫描当前回合（最后一条 role=user 之后），历史回合的调用一律不算。
 
-    This is a code-level cost gate: the review model must not be started merely to
-    decide whether the turn contained anything worth recording.
+_READ_ONLY_TOOLS = {
+    "read_file", "search_files", "web_search", "web_extract",
+    "hindsight_recall", "hindsight_reflect", "search_knowledge",
+    "skill_view", "tool_search", "tool_describe",
+}
+
+_KB_CARD_WRITE_TOOLS = {"save_reflection", "edit_reflection_card", "delete_reflection_card"}
+
+
+def _scan_turn_tool_calls(messages):
+    """扫描当前回合，返回 ``(calls, results)``。
+
+    ``calls[call_id] = (tool_name, arguments_dict)``，``results[call_id] = tool message``。
+    只认最后一条 ``role=user`` 之后的调用：旧回合的写卡不能替本回合作证。
     """
     if not isinstance(messages, list):
-        return False
-
-    # ``messages`` is the conversation snapshot, not necessarily this turn alone.
-    # Old tool calls must never authorize a review for a later plain-chat turn.
-    current_turn_start = next(
+        return {}, {}
+    turn_start = next(
         (index for index in range(len(messages) - 1, -1, -1)
          if isinstance(messages[index], dict) and messages[index].get("role") == "user"),
         None,
     )
-    if current_turn_start is None:
-        return False
-    messages = messages[current_turn_start:]
-
-    read_only_tools = {
-        "read_file", "search_files", "web_search", "web_extract",
-        "hindsight_recall", "hindsight_reflect", "search_knowledge",
-        "skill_view", "tool_search", "tool_describe",
-    }
-    calls = {}
-    results = {}
-    for message in messages:
+    if turn_start is None:
+        return {}, {}
+    calls, results = {}, {}
+    for message in messages[turn_start:]:
         if not isinstance(message, dict):
             continue
         if message.get("role") == "assistant":
@@ -2087,13 +2140,72 @@ def _has_successful_work_tool_call(messages) -> bool:
                 call_id = call.get("id")
                 function = call.get("function") or {}
                 name = function.get("name") if isinstance(function, dict) else None
-                if call_id and name:
-                    calls[call_id] = name
+                if not (call_id and name):
+                    continue
+                raw_args = function.get("arguments") if isinstance(function, dict) else None
+                args = raw_args if isinstance(raw_args, dict) else {}
+                if isinstance(raw_args, str):
+                    with suppress(ValueError, TypeError):
+                        parsed = json.loads(raw_args)
+                        if isinstance(parsed, dict):
+                            args = parsed
+                calls[call_id] = (name, args)
         elif message.get("role") == "tool":
             call_id = message.get("tool_call_id")
             if call_id:
                 results[call_id] = message
+    return calls, results
 
+
+def _payload_of(result):
+    """取工具结果的结构化载荷：JSON 前缀能解析就用它，否则原样返回。
+
+    KB 标题清单会跟在合法 JSON 后面，整段交给失败判据会被后缀干扰
+    （``exit_code=7`` 这类文本曾因此被误判成成功）。
+    """
+    content = result.get("content")
+    if isinstance(content, str):
+        with suppress(ValueError):
+            payload, _end = json.JSONDecoder().raw_decode(content.lstrip())
+            if isinstance(payload, dict):
+                return payload
+    return content
+
+
+def _main_thread_wrote_cards(calls, results) -> bool:
+    """本轮主线程是否**成功**写过反思卡。
+
+    三个排除项，都是「看着像写了，其实没写」：
+      - ``mode=find``：只读找卡，磁盘一个字没动；
+      - 没有工具结果：调用被中断，落没落不确定，宁可让 fork 兜一次；
+      - 载荷带 ``error``：卡没改成。
+    """
+    for call_id, (name, args) in calls.items():
+        if name not in _KB_CARD_WRITE_TOOLS:
+            continue
+        if name == "edit_reflection_card":
+            mode = str(args.get("mode") or "").strip().lower()
+            if mode in ("", "find"):
+                continue
+        result = results.get(call_id)
+        if result is None:
+            continue
+        payload = _payload_of(result)
+        if isinstance(payload, dict) and payload.get("error"):
+            continue
+        if isinstance(payload, str) and '"error"' in payload:
+            continue
+        return True
+    return False
+
+
+def _has_successful_work_tool_call(messages) -> bool:
+    """Only review turns that completed a non-retrieval tool successfully.
+
+    This is a code-level cost gate: the review model must not be started merely to
+    decide whether the turn contained anything worth recording.
+    """
+    calls, results = _scan_turn_tool_calls(messages)
     if not calls or not results:
         return False
 
@@ -2104,24 +2216,33 @@ def _has_successful_work_tool_call(messages) -> bool:
         # don't spend a model call on an unverified tool outcome.
         return False
 
-    for call_id, name in calls.items():
-        if name in read_only_tools:
+    for call_id, (name, _args) in calls.items():
+        if name in _READ_ONLY_TOOLS:
             continue
         result = results.get(call_id)
         if result is None:
             continue
-        content = result.get("content")
-        if isinstance(content, str):
-            # KB menus can follow an otherwise valid JSON result. Classify the
-            # structured payload, not the presentation suffix added by plugins.
-            with suppress(ValueError):
-                payload, end = json.JSONDecoder().raw_decode(content.lstrip())
-                if isinstance(payload, dict):
-                    content = payload
+        content = _payload_of(result)
         failed, _ = _detect_tool_failure(name, content)
         if not failed:
             return True
     return False
+
+
+def _sop_fork_gate(messages):
+    """fork 准入：返回 ``(是否启动, 原因)``，原因只用于日志判别。
+
+    ``cards-written`` 是本轮主线程自己沉淀过了；``no-work-tool`` 是纯聊天或
+    只读回合；``work-tool`` 才是真正要起 fork 的情形。
+    """
+    calls, results = _scan_turn_tool_calls(messages)
+    if not calls:
+        return False, "no-turn-calls"
+    if _main_thread_wrote_cards(calls, results):
+        return False, "cards-written"
+    if _has_successful_work_tool_call(messages):
+        return True, "work-tool"
+    return False, "no-work-tool"
 
 
 def _patch_sop_fork() -> None:
@@ -2186,10 +2307,11 @@ def _patch_sop_fork() -> None:
                 and not kwargs.get("failed")
                 and not getattr(agent, "skip_background_review", False)
             ):
-                eligible = _has_successful_work_tool_call(snapshot)
+                eligible, gate_reason = _sop_fork_gate(snapshot)
                 logger.info(
-                    "[KBWrite] sop fork gate=%s pid=%s session=%s",
-                    "run" if eligible else "skip", os.getpid(), getattr(agent, "session_id", None),
+                    "[KBWrite] sop fork gate=%s reason=%s pid=%s session=%s",
+                    "run" if eligible else "skip", gate_reason, os.getpid(),
+                    getattr(agent, "session_id", None),
                 )
                 if not eligible:
                     return result
@@ -2226,7 +2348,7 @@ def _patch_sop_fork() -> None:
 REFLECTION_RULES = "## 知识库记录与维护\n\n" + REFLECTION_CONTENT_POLICY
 
 
-def register(ctx: Any) -> None:
+def register_write(ctx: Any) -> None:
     _patch_toolsets_core()
     _patch_sop_fork()
     _patch_review_notify_tools()
@@ -2292,7 +2414,7 @@ def register(ctx: Any) -> None:
         _lines = sum(len(p.read_text(encoding="utf-8").splitlines())
                      for p in sorted(_pkg.glob("*.py")))
         logger.info(
-            "hermes-kb-write code md5=%s (%s 行) registered — save_reflection 查重闸门 + "
+            "hermes-kb/write code md5=%s (%s 行) registered — save_reflection 查重闸门 + "
             "edit/delete 卡出口 + hermes_kb 自举", _md5, _lines,
         )
     except Exception:  # noqa: BLE001 - 留痕失败绝不影响注册

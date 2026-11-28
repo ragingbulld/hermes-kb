@@ -25,29 +25,27 @@ from .resident import _ensure_core_resident
 from .sandbox import install_sandbox_rpc_scope, install_stub_kb_query_tolerance
 
 __all__ = [
-    "register",
+    "register_inject",
     "KBAutoInjectPlugin",
     "plugin_instance",
     "search_knowledge_handler",
     "SEARCH_KB_SCHEMA",
 ]
 
-# KB 工具图标只在 `hermes-kb-write` 里登记一份真源（它同时管写/改/删三个工具），
-# 这里按软引用去取，避免两处各写一个 emoji 各自漂移。兄弟插件缺席时用同一个字面量
-# 兜底 —— 图标不值得让工具注册失败。
+# KB 工具图标只在写侧（`write.py`）登记一份真源，它同时管写/改/删三个工具。
+# 合并进同一个包之前这行是 `from hermes_plugins.hermes_kb_write import TOOL_EMOJI`
+# 加一层 ImportError 兜底 —— 拆两个插件时只能软引用，现在同包直接取。
 _KB_TOOL_EMOJI_FALLBACK = {"search_knowledge": "📇"}
 
 
 def _kb_tool_emoji(tool_name: str) -> str:
     """Return the KB-family glyph for *tool_name* from the shared table, else the fallback."""
-    try:
-        from hermes_plugins.hermes_kb_write import TOOL_EMOJI
-    except ImportError:                      # 兄弟插件未装 / 未加载：用本地同值兜底
-        return _KB_TOOL_EMOJI_FALLBACK.get(tool_name, "")
+    from .write import TOOL_EMOJI
+
     return TOOL_EMOJI.get(tool_name) or _KB_TOOL_EMOJI_FALLBACK.get(tool_name, "")
 
 
-def register(ctx: Any) -> None:
+def register_inject(ctx: Any) -> None:
     """注册三样东西：注入中间件、search_knowledge 工具、kb_query 门禁补丁。
 
     **出口只有一个，时机是「下一次模型请求之前」**：检索结果一返回，池子回调
@@ -75,6 +73,17 @@ def register(ctx: Any) -> None:
     # 入口一：每 turn 提交用户原话。出口：llm_request 中间件贴进请求副本。
     ctx.register_hook("pre_llm_call", plugin_instance.handle_pre_llm_call)
     ctx.register_middleware("llm_request", plugin_instance.handle_llm_request)
+
+    # 读正文时补一行「这张卡什么时候写的」。只在 `read_file` 命中**索引内文件**
+    # 时动手（判据是 `file_records` 里有没有这个路径），别的工具与普通文件原样放行。
+    # 单独包一层：老版本 Hermes 没有这个钩子时注册会抛，不能把整个插件拖垮 ——
+    # 插件加载失败等于注入静默归零（2026-09-30 事故）。
+    try:
+        ctx.register_hook(
+            "transform_tool_result", plugin_instance.handle_transform_tool_result
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[KBAutoInject] transform_tool_result 注册失败：%s", exc)
     
     # 注册主动查库工具 search_knowledge
     ctx.register_tool(
@@ -120,7 +129,7 @@ def register(ctx: Any) -> None:
     # 就是 grep 它 + 插件名 + 时间戳（热重载不改进程启动时间，只能靠这条留痕翻案）。
     # 曾写成 `registered: md5=`，与判据对不上，改动明明已装载却天天报「需 reload」。
     logger.info(
-        "hermes-kb-auto-inject code md5=%s (%s 行, %s 个模块) registered — kb_query 门禁 + 标题清单池 "
+        "hermes-kb/inject code md5=%s (%s 行, %s 个模块) registered — kb_query 门禁 + 标题清单池 "
         "+ 单注入出口（llm_request 中间件贴请求副本尾部，不落 state.db、不等工具、不压请求）；"
         "检索入口两条：用户原话（每轮一次）+ 每次工具调用的 kb_query，同一池；**无去重账**",
         _md5, _lines, len([p for p in _pl.Path(__file__).parent.glob("*.py")]),

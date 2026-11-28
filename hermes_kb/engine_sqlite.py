@@ -41,6 +41,76 @@ logger = logging.getLogger(__name__)
 # 占着池位不放 —— 加上限后它自己会收手，不用等下次提交来挤。
 MAX_ATTEMPTS = 5
 
+# file_records 的写入语义：**哈希不变就绝不改时间**。
+# 文件系统 mtime 会被整目录拷贝整片刷掉（实测 993 个文件落在同一秒），
+# 所以「内容到底变没变」只认哈希 —— 它是唯一不会撒谎的信号。
+# 三条时间各管一件事：
+#   first_seen    第一次见到，写入后永不更新
+#   last_changed  哈希真变才推进；hash 相同则一步不动
+#   time_source   'live' 实测 / 'backfill' 从老 updated_at 补的近似值
+_FILE_RECORD_UPSERT = """
+    INSERT INTO file_records
+        (file_path, file_hash, mtime, chunk_count, updated_at,
+         first_seen, last_changed, time_source)
+    VALUES (?,?,?,?,?,?,?,'live')
+    ON CONFLICT(file_path) DO UPDATE SET
+        chunk_count  = excluded.chunk_count,
+        mtime        = excluded.mtime,
+        updated_at   = excluded.updated_at,
+        -- SET 里引用的 file_records.* 是**旧行**，与 SET 顺序无关
+        first_seen   = COALESCE(file_records.first_seen, excluded.first_seen),
+        last_changed = CASE
+            WHEN file_records.file_hash IS excluded.file_hash
+            THEN COALESCE(file_records.last_changed, excluded.last_changed)
+            ELSE excluded.last_changed END,
+        time_source  = CASE
+            WHEN file_records.file_hash IS excluded.file_hash
+            THEN COALESCE(file_records.time_source, 'backfill')
+            ELSE 'live' END,
+        file_hash    = excluded.file_hash
+"""
+
+# 块级时间，语义与 `_FILE_RECORD_UPSERT` 完全一致，只是从「文件」降到「一节」：
+#   相同 fingerprint → 一步不动；变了 → 推进 last_changed 并转 'live'。
+# 一个文件里只改了一节时，只有那一节的 last_changed 会动，其余各节保持原值 ——
+# 这就是「块级」的全部意义（文件级做不到，改哪都算整卡更新）。
+_CHUNK_TIME_UPSERT = """
+    INSERT INTO chunk_times
+        (file_path, heading_path, text_hash, first_seen, last_changed, time_source)
+    VALUES (?,?,?,?,?,'live')
+    ON CONFLICT(file_path, heading_path) DO UPDATE SET
+        first_seen   = COALESCE(chunk_times.first_seen, excluded.first_seen),
+        last_changed = CASE
+            WHEN chunk_times.text_hash IS excluded.text_hash
+            THEN COALESCE(chunk_times.last_changed, excluded.last_changed)
+            ELSE excluded.last_changed END,
+        time_source  = CASE
+            WHEN chunk_times.text_hash IS excluded.text_hash
+            THEN COALESCE(chunk_times.time_source, 'backfill')
+            ELSE 'live' END,
+        text_hash    = excluded.text_hash
+"""
+
+# 播种用：只补空缺、**不改**已有行，所以是 INSERT OR IGNORE 而不是上面那个
+# upsert。补出来的值一律标 backfill —— 来源是 chunks.updated_at，那只是
+# 「这个文件最后一次重切」的时刻，不是这一节自己的变化时刻。
+_CHUNK_TIME_SEED = """
+    INSERT OR IGNORE INTO chunk_times
+        (file_path, heading_path, text_hash, first_seen, last_changed, time_source)
+    VALUES (?,?,?,?,?,'backfill')
+"""
+
+
+def _section_fingerprint(hashes) -> str:
+    """一节被切成 N 片时的复合指纹：按顺序拼起来再取 md5。
+
+    ``hashes`` 是该节各片的 ``text_hash`` 列表，按写入顺序。
+    为什么不直接 `"|".join`：片数会变，拼出来的串长度无上限，而且
+    「A|B」和「AB」这种边界在真实哈希里撞不了，但没必要赌 —— 一次 md5
+    定长 32 字符，索引和比较都省事。
+    """
+    return hashlib.md5("\x1f".join(hashes).encode("utf-8")).hexdigest()
+
 
 class AbortSlot:
     """一次检索的中断句柄：把阻塞在读上的 HTTP 请求当场掐断。
@@ -397,14 +467,67 @@ class KBEngine:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS file_records (
-                    file_path   TEXT PRIMARY KEY,
-                    file_hash   TEXT,
-                    mtime       REAL,
-                    chunk_count INTEGER,
-                    updated_at  REAL
+                    file_path    TEXT PRIMARY KEY,
+                    file_hash    TEXT,
+                    mtime        REAL,
+                    chunk_count  INTEGER,
+                    updated_at   REAL,
+                    -- 第一次见到这个文件，写入后永不更新。
+                    first_seen   REAL,
+                    -- 内容哈希真正变化的时刻。hash 不变就一步不动 ——
+                    -- mtime 会被批量拷贝整片刷掉（实测 993 个文件同一秒），
+                    -- 只有内容哈希不会撒谎。
+                    last_changed REAL,
+                    -- 'live' = 真测出来的；'backfill' = 从老 updated_at 补的近似值。
+                    time_source  TEXT DEFAULT 'live'
                 )
                 """
             )
+            # 块级时间。**不能挂在 chunks 上**：`_write_chunks_tx` 每次都是
+            # `DELETE FROM chunks WHERE file_path=?` 后整文件重插，加在 chunks 的
+            # 列会被一起删掉 —— 改一个字，整文件所有块的时间变「刚刚」，
+            # 那正是 mtime 犯过的错。
+            #
+            # 主键用 (file_path, heading_path) 而不是 chunk_id：chunk_id 是
+            # content 前 50 字的 md5，改开头就换 id，追踪不到同一节的演化。
+            # 也不用 part_index —— 同节多片在行范围上本来就是同一节，
+            # 读的时候分不出来，存两个时间没有意义。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_times (
+                    file_path    TEXT NOT NULL,
+                    heading_path TEXT NOT NULL DEFAULT '',
+                    -- 同节多片：各片 text_hash 按序拼接再取 md5，作为一个复合指纹。
+                    text_hash    TEXT,
+                    first_seen   REAL,
+                    last_changed REAL,
+                    time_source  TEXT DEFAULT 'live',
+                    PRIMARY KEY (file_path, heading_path)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunk_times_path "
+                "ON chunk_times(file_path)"
+            )
+            # 建表后补一次空洞 —— 新库、从备份恢复的库、写入失败那一轮
+            # 都会留下「有 chunks 没时间」的文件，不补就读不到时间。
+            self._seed_chunk_times(conn)
+            # 老库是 ALTER 加上来的，新库直接建在 DDL 里 —— 两处都要有，
+            # 否则重建库/换机器时这张表没有时间列，读侧会崩在 "no such column"。
+            _fr_cols = {r[1] for r in conn.execute("PRAGMA table_info(file_records)")}
+            for _col, _ddl in (
+                ("first_seen", "REAL"),
+                ("last_changed", "REAL"),
+                ("time_source", "TEXT DEFAULT 'live'"),
+            ):
+                if _col not in _fr_cols:
+                    conn.execute(
+                        f"ALTER TABLE file_records ADD COLUMN {_col} {_ddl}"
+                    )
+                    logger.info(
+                        "[KBEngine] migrated file_records: added %s column", _col
+                    )
             # FTS5：bi 列存 _fts_tokens 切好的 token 串（汉字二字滑窗 + ASCII 整词）。
             # 行号用 FTS5 自带的 rowid（= chunks.id），不再另开 id UNINDEXED 列。
             # 原因：UNINDEXED 列不建索引，`DELETE ... WHERE id = ?` 会 SCAN 整张
@@ -436,6 +559,63 @@ class KBEngine:
                 )
             self._migrate_fts_tokenizer(conn)
             conn.commit()
+
+    def _seed_chunk_times(self, conn) -> int:
+        """给 chunk_times 补空洞：有 chunks、没时间的文件，从切片反推一次。
+
+        为什么必须自愈，而不是「上线时跑一次脚本」：`chunk_times` 只在内容
+        真正变化时写入，所以下面三种情况都会留下空洞，而**空洞不报错** ——
+        读侧只是查不到这一行、整块不显示时间：
+
+        - 表建起来之前就已经索引好的文件（首次上线）；
+        - 写入那一次抛异常回滚了（键值绑定写错那次就是这样）；
+        - 从旧备份恢复库。
+
+        反推值一律 ``backfill``：``chunks.updated_at`` 是「文件最后一次重切」
+        的时刻，同一张卡改一节，其余节的这个值也会一起刷新 —— 拿它冒充
+        「本节变化时刻」，就是把文件级的老毛病按节再犯一遍。
+
+        幂等：只挑 `chunk_times` 里完全没有的文件 + `INSERT OR IGNORE`，
+        所以正常运行全程只会扫到一个空结果（实测 68k 块 ~200ms）。
+        """
+        missing = conn.execute(
+            "SELECT DISTINCT file_path FROM chunks "
+            "WHERE file_path NOT IN (SELECT file_path FROM chunk_times)"
+        ).fetchall()
+        if not missing:
+            return 0
+        now = time.time()
+        seeded = 0
+        for (file_path,) in missing:
+            rows = conn.execute(
+                "SELECT coalesce(heading_path,''), text_hash, updated_at "
+                "FROM chunks WHERE file_path=? ORDER BY id",
+                (file_path,),
+            ).fetchall()
+            per_head = {}
+            for heading, text_hash, updated_at in rows:
+                per_head.setdefault(heading, []).append((text_hash, updated_at))
+            for heading, items in per_head.items():
+                stamps = [u for _t, u in items if u is not None]
+                conn.execute(
+                    _CHUNK_TIME_SEED,
+                    (
+                        file_path,
+                        heading,
+                        # 与 _write_chunks_tx 同一算法：按写入顺序拼各片哈希
+                        _section_fingerprint([t or "" for t, _u in items]),
+                        min(stamps) if stamps else now,
+                        max(stamps) if stamps else now,
+                    ),
+                )
+                seeded += 1
+        conn.commit()
+        logger.info(
+            "[KBEngine] seeded chunk_times: %d sections / %d files (backfill)",
+            seeded,
+            len(missing),
+        )
+        return seeded
 
     def _migrate_fts_tokenizer(self, conn):
         """切词口径变了就重建 fts。
@@ -1229,16 +1409,17 @@ class KBEngine:
             ).fetchone()
 
     def set_file_record(self, file_path, file_hash, mtime, chunk_count):
+        """记录「这个文件被索引成了几块」，顺带按内容哈希推进时间。
+
+        推进规则见 `_FILE_RECORD_UPSERT`：**hash 没变就不动 `last_changed`**。
+        这条函数同时被 `watcher` 的「解析不出正文 → 清空索引」路径调用，
+        那里 hash 通常是新的，所以照样会推进。
+        """
+        now = time.time()
         with self._conn() as conn:
             conn.execute(
-                """
-                INSERT INTO file_records (file_path, file_hash, mtime, chunk_count, updated_at)
-                VALUES (?,?,?,?,?)
-                ON CONFLICT(file_path) DO UPDATE SET
-                    file_hash=excluded.file_hash, mtime=excluded.mtime,
-                    chunk_count=excluded.chunk_count, updated_at=excluded.updated_at
-                """,
-                (file_path, file_hash, mtime, chunk_count, time.time()),
+                _FILE_RECORD_UPSERT,
+                (file_path, file_hash, mtime, chunk_count, now, now, now),
             )
 
     def delete_file_record(self, file_path: str):
@@ -1259,6 +1440,9 @@ class KBEngine:
         """
         now = time.time()
         fts_rows, new_ids, new_vecs = [], [], []
+        # heading_path → 该节各片的 text_hash（按写入顺序）。循环后聚合成
+        # 一个复合指纹写进 chunk_times；同一节被切成几片也只留一行时间。
+        per_head = {}
         with self._conn() as conn:
             old_ids = [
                 r[0]
@@ -1324,6 +1508,7 @@ class KBEngine:
                 fts_rows.append((row_id, self._fts_tokens(f"{heading} {content}")))
                 new_ids.append(int(row_id))
                 new_vecs.append(v)
+                per_head.setdefault(heading, []).append(text_hash)
 
             if fts_rows:
                 conn.executemany("INSERT INTO fts(rowid, bi) VALUES (?,?)", fts_rows)
@@ -1331,15 +1516,31 @@ class KBEngine:
             # 同步状态和切片写在同一事务 —— 要么全成，要么全不成。
             if file_hash is not None:
                 conn.execute(
-                    """
-                    INSERT INTO file_records
-                        (file_path, file_hash, mtime, chunk_count, updated_at)
-                    VALUES (?,?,?,?,?)
-                    ON CONFLICT(file_path) DO UPDATE SET
-                        file_hash=excluded.file_hash, mtime=excluded.mtime,
-                        chunk_count=excluded.chunk_count, updated_at=excluded.updated_at
-                    """,
-                    (file_path, file_hash, mtime or now, len(chunks), now),
+                    _FILE_RECORD_UPSERT,
+                    (file_path, file_hash, mtime or now, len(chunks), now, now, now),
+                )
+
+            # 块级时间：按 heading_path 聚合，同节多片拼成一个指纹。
+            # 与 chunks 同事务 —— 块的增删和它的时间记录不能分开提交，
+            # 否则中断会留下「块有了但时间没记」或反过来。
+            if per_head:
+                cur_heads = {}
+                for _h, _hs in per_head.items():
+                    cur_heads[_h] = _section_fingerprint(_hs)
+                    conn.execute(
+                        _CHUNK_TIME_UPSERT,
+                        (file_path, _h, cur_heads[_h], now, now),
+                    )
+                # 这一节被删掉了（文件重切后这节没有了）→ 时间记录一起走
+                _ph = ",".join("?" * len(cur_heads))
+                conn.execute(
+                    f"DELETE FROM chunk_times WHERE file_path=? "
+                    f"AND heading_path NOT IN ({_ph})",
+                    (file_path, *cur_heads.keys()),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM chunk_times WHERE file_path=?", (file_path,)
                 )
         # with 退出即提交；异常自动 rollback，旧数据原样保留
 
@@ -1447,6 +1648,11 @@ class KBEngine:
                 if ids:
                     self._fts_delete(conn, ids)
                     conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+                # 块级时间跟着走：文件没了还留着它的分节时间，读侧会把
+                # 「已删除的节」当成有效块参与求交。
+                conn.execute(
+                    "DELETE FROM chunk_times WHERE file_path = ?", (file_path,)
+                )
                 conn.commit()
             self._remove_vectors(ids)
             return True
@@ -1788,6 +1994,7 @@ class KBEngine:
                         self._fts_delete(conn, ids)
                         conn.execute("DELETE FROM chunks WHERE file_path = ?", (p,))
                         conn.execute("DELETE FROM file_records WHERE file_path = ?", (p,))
+                        conn.execute("DELETE FROM chunk_times WHERE file_path = ?", (p,))
                         total += len(ids)
                 conn.commit()
             logger.info("[KBEngine] pruned %d chunks from dead source files", total)

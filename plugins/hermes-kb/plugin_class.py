@@ -7,14 +7,19 @@
 schema/handler 在 `.registration`。
 """
 
+import bisect
+import datetime
 import hashlib
+import json
 import logging
 import os
 import re
 import sqlite3
 import sys
 import threading
+import time
 from collections import OrderedDict
+from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
 
 from .async_pool import KBAsyncPool
@@ -66,22 +71,48 @@ def _path_parts(heading_path) -> List[str]:
     return _split_heading_path(hp)
 
 
+_MISS = object()
+
+
+class _TTL:
+    """极简 TTL 缓存：命中即返回，条目超上限整表清掉。
+
+    为什么不用 LRU：键是「路径 + 读取区间」，一个会话撑死几十个，清空一次
+    的代价只是重查几毫秒 —— 为这个维护链表不划算。
+
+    命中判断用 ``_MISS`` 而不是 ``None``：``None`` 在这里是**合法值**
+    （「这个路径不在索引里」），拿返回值判命中会把「查过了、没有」误当成
+    「没查过」，每次都重新打库。
+    """
+
+    __slots__ = ("_d", "ttl", "cap")
+
+    def __init__(self, ttl: float = 60.0, cap: int = 512) -> None:
+        self._d: Dict[Any, Tuple[float, Any]] = {}
+        self.ttl = ttl
+        self.cap = cap
+
+    def get(self, key) -> Any:
+        hit = self._d.get(key)
+        if hit is not None and time.time() - hit[0] < self.ttl:
+            return hit[1]
+        return _MISS
+
+    def put(self, key, val) -> None:
+        if len(self._d) > self.cap:
+            self._d.clear()
+        self._d[key] = (time.time(), val)
+
+
 class KBAutoInjectPlugin:
     """Execution-state-driven knowledge base retriever and API-bound injector."""
 
-    # 单次请求最多合并几批清单（一个检索任务 = 一批）。
-    # 只限**批**，不限批内的卡：阈值仍是唯一质量闸（injection-gate-rules §7.5）。
-    # 为什么是 2：早批对应的工具调用已经跑完，下文生成只缺最近动作的坐标；
-    # 实测一轮峰值 3 批 / 8.5k 字符，2 批足够覆盖「用户原话 + 当前动作」。
-    # **超出的是排队，不是丢弃** —— 剩下的留在槽里等下一个请求，不设字符预算。
-    _MAX_MERGED_MENUS = 2
-    # 待投递槽的**容量硬上限**（槽里最多压几批，不含本次投出去的）。
-    # 只有一个作用：防无界积压。每轮投 2 批、实测新进 1.47 批/轮，
-    # 常态槽深度 ≤ 2，摸不到这条线；真摸到了就是连续多轮进 3 批以上，
-    # 那时旧批已经和当前动作脱节，丢掉比拖着更有价值。
-    # **不看积压深度改投递顺序** —— 永远只投提示词里最新的 2 批。
-    _MAX_PENDING_SLOTS = 6
-
+    # 待投递槽**没有批次闸**：攒了几批就一次投几批。
+    # 早先这里是三道闸纠缠 ——「每次只投最新 2 批、其余排队、超 6 批削最旧」。
+    # 实测常态 1.47 批/请求，闸从没起过作用；只在连续高并发的少数窗口里
+    # 把**检索成本已经付掉**的清单悄悄丢掉（dropped 记账只留一个数字，看不出丢了什么）。
+    # 既然全投，槽在每次请求后必空，积压上限与 dropped 记账一起失去意义。
+    # owner 2026-11-26：「合并注入限制删干净优雅点」。
     def __init__(self):
         # 类型注解用 Any：KBEngine 已改为惰性导入，运行时不再求值该符号
         self._engine: Optional[Any] = None
@@ -96,7 +127,10 @@ class KBAutoInjectPlugin:
         # 带检索词是为了出口能回查它在**当前提示词**里的位置 —— 服务端排新的
         # 依据是「提示词里最靠后」，既不认完成时间，也不认提交序号（并行段乱序）。
         # 不记「印过哪张卡」、不扫历史比对、不按词查重 —— 去重整套删掉了（owner 2026-11-24 定案）。
-        self._pending: Dict[str, List[Tuple[int, str, str]]] = {}
+        # sid -> [(提交序号, 检索词, 清单), ...]。清单是**结构化菜单**（`_build_menu`
+        # 的产物，一张卡一条），不是渲染好的字符串 —— 出口要把多批合成一屏，只有
+        # 拿到结构才能把同一张卡的命中落点并成一棵树。渲染统一在出口那一次做。
+        self._pending: Dict[str, List[Tuple[int, str, List[Dict[str, Any]]]]] = {}
         self._pending_lock = threading.Lock()
         # kb_query 的后台检索池：只跑 retrieve（慢的网络段）。**跑完当场回调**
         # `_on_job_done` 把清单塞进待投递槽 —— 池子里没有「等人来取」的成品。
@@ -204,9 +238,6 @@ class KBAutoInjectPlugin:
         """
         return (str(chunk.get("file_path") or ""), cls._card_title(chunk))
 
-    # 「这张卡一共多少字」的进程内缓存。一屏 6 张卡 = 6 次聚合查询（实测 1 ms），
-    # 缓存只是防长会话里反复问同一张；热重载会清空，无所谓。
-    _size_cache: Dict[str, Tuple[int, int]] = {}
     # 整卡行数 / 命中块行号：read_file 的 offset/limit 是按行的，这两个缓存让
     # 一屏清单只读一次文件（同一个 file_path 的多块共用）。
     _disk_cache: Dict[str, Tuple[str, int]] = {}
@@ -214,36 +245,285 @@ class KBAutoInjectPlugin:
     _outline_cache: Dict[str, Dict[str, Any]] = {}
     # (文件, 链) → 行范围。画树时同一节点会被问很多次，不缓存就是重复全扫。
     _span_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[Tuple[int, int, int], ...]] = {}
+    # 读正文时补的时间摘要：(path, offset, limit) → (检查时刻, 文本)，60s TTL。
+    # 键必须带上读取区间 —— 同一个文件读不同段落，命中的节不同，时间也不同。
+    # (路径, offset, limit) → 文案；路径 → {heading_path: (last_changed, source)}。
+    # 都 60 秒过期：一轮对话里反复读同一张卡不必次次打库，又不能缓存太久，
+    # 否则刚补完这张卡、回头读还是旧时间。
+    _time_cache = _TTL()
+    _times_cache = _TTL()
+    _rec_cache = _TTL()
+    # 正文头部的时间行：「- **记录时间 / 生效日期**：2026-11-28 11:40:49 (UTC+8)」。
+    # 只认这三个词 —— 正文里别处出现的「时间」多数在讲别的事，抓了就是误报。
+    _TIME_PAT = re.compile(
+        r"(记录时间|生效日期|更新时间)\s*[:：]?\s*[^\d\n]{0,8}"
+        r"(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?"
+    )
 
-    def _card_size(self, file_path: str) -> Tuple[int, int]:
-        """这张卡在库里一共多少字、切成几块。
+    def _chunk_times(self, path: str):
+        """``{heading_path: (last_changed, time_source)}``；不在索引里回 ``None``。
 
-        是**入库字数**（块之间有重叠），比磁盘原文略大；但库是自足的，文件被移走也不影响。
-        查不到就回 (0, 0)，菜单那行不印 —— 宁可少一行，不印「0 字」误导。
+        判据只有一条：`chunk_times` 里有没有这个路径。有，就是知识块；没有，
+        就是普通文件 —— 目录、后缀、名字一概不看，所以同一个源目录里混着
+        代码和卡片也不会误判。
+
+        时间按**每一节自己的内容哈希**推进（引擎侧 `_CHUNK_TIME_UPSERT`）：
+        一节没变，它那一行就一步不动。所以「三个月没动的卡、上周刚补了一个
+        坑」读老段落时不会误显示成「刚改过」—— 这是文件级时间做不到的。
         """
-        if not file_path:
-            return (0, 0)
-        hit = self._size_cache.get(file_path)
-        if hit:
+        if not path:
+            return None
+        hit = self._times_cache.get(path)
+        if hit is not _MISS:
             return hit
-        val: Tuple[int, int] = (0, 0)
+        rows = None
         try:
-            db_dir = str(getattr(self.engine, "db_dir", "") or "")
-            db = os.path.join(db_dir, "kb.sqlite3")
-            if db_dir and os.path.exists(db):
+            db = os.path.join(
+                str(getattr(self.engine, "db_dir", "") or ""), "kb.sqlite3"
+            )
+            if os.path.exists(db):
                 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
                 try:
-                    row = con.execute(
-                        "SELECT SUM(LENGTH(content)), COUNT(*) FROM chunks WHERE file_path=?",
-                        (file_path,),
-                    ).fetchone()
-                    val = (int(row[0] or 0), int(row[1] or 0))
+                    got = con.execute(
+                        "SELECT heading_path, last_changed, time_source "
+                        "FROM chunk_times WHERE file_path=?",
+                        (path,),
+                    ).fetchall()
                 finally:
                     con.close()
-        except Exception:
-            val = (0, 0)
-        self._size_cache[file_path] = val
-        return val
+                # 一行都没有 = 旧库还没播种过 → 当作不在库，宁可不印
+                rows = (
+                    {(r[0] or ""): (r[1], r[2] or "") for r in got} if got else None
+                )
+        except Exception:  # noqa: BLE001 —— 查不到就当不是知识块，宁可少印一行
+            rows = None
+        self._times_cache.put(path, rows)
+        return rows
+
+    def _heading_chain(self, heading_path: str) -> List[str]:
+        """`heading_path` → 标题链。
+
+        老数据用 `" > "` 拼、新数据用 ``\\x1f``，混在同一个库里（实测 51286 条
+        老格式）。拆分**只认 `heading.py` 那一份实现** —— 它会对老数据做括号
+        平衡回补，自己 `split(" > ")` 会把「（64000 > 32768）」这类标题切碎。
+
+        必须走 `_path_parts`，不能直接读 `_split_heading_path`：后者是延迟导入的
+        结果，`_path_parts` 才负责触发那次导入。早先这里自己判断了一遍全局变量，
+        于是**首次调用时它还是 None**，整条链被当成单层返回 —— 老格式的卡全靠
+        `_find` 的宽松前缀匹配挂到父节上，行范围永远是父节范围，`(Part N)` 拆出
+        来的多片也从来归不到同一节。
+        """
+        return _path_parts(heading_path) if heading_path else []
+
+    @staticmethod
+    def _ago(ts: float) -> str:
+        """``1670000000`` → ``3 天前``。相对时间才是「时效感」的来源，绝对日期只给坐标。"""
+        delta = max(0.0, time.time() - float(ts))
+        if delta < 3600:
+            return "不到 1 小时前"
+        if delta < 86400:
+            return f"{int(delta // 3600)} 小时前"
+        days = int(delta // 86400)
+        if days < 60:
+            return f"{days} 天前"
+        return f"{days // 30} 个月前"
+
+    def _card_time_text(
+        self, path: str, offset: Any = None, limit: Any = None
+    ) -> str:
+        """按**读到的行范围**算这张卡的时间：``记于 … · 修订 …``。
+
+        两路来源各管一件事：
+        - 「记于」＝正文里作者手写的记录时间，语义权威，不受系统重写影响；
+        - 「修订」＝**这一节自己的内容哈希**上次真正变化的时刻。
+
+        为什么按行范围挑而不是整卡一个值：一个文件里每节各有各的
+        `last_changed`。读整卡时取最新；只读命中段时只看相交的那几节 ——
+        这样「三个月没动的卡、上周刚补了一个坑」读老段落时不会误显示成「刚改过」。
+        """
+        cache_key = (path, offset, limit)
+        hit = self._time_cache.get(cache_key)
+        if hit is not _MISS:
+            return hit
+        text = " · ".join(
+            x
+            for x in (self._rec_stamp(path), self._rev_text(path, offset, limit))
+            if x
+        )
+        self._time_cache.put(cache_key, text)
+        return text
+
+    def _rec_db(self, path: str) -> Optional[Tuple[float, str]]:
+        """``file_records`` 里这文件的 ``(first_seen, time_source)``。"""
+        hit = self._rec_cache.get(path)
+        if hit is not _MISS:
+            return hit
+        row = None
+        try:
+            db = os.path.join(
+                str(getattr(self.engine, "db_dir", "") or ""), "kb.sqlite3"
+            )
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            try:
+                r = con.execute(
+                    "SELECT first_seen, time_source FROM file_records "
+                    "WHERE file_path=?",
+                    (path,),
+                ).fetchone()
+            finally:
+                con.close()
+            if r and r[0]:
+                row = (float(r[0]), str(r[1] or ""))
+        except Exception:  # noqa: BLE001 —— 查不到就当没有
+            row = None
+        self._rec_cache.put(path, row)
+        return row
+
+    def _rec_stamp(self, path: str) -> str:
+        """「记于 …」：这张卡是什么时候写的。
+
+        **表优先**。`file_records.first_seen` 由引擎记，不依赖正文文字 —— 卡头
+        那行「记录时间」因此可以从写卡模板里去掉，老卡留着也不影响显示。
+        只认 `card`（从老卡正文迁过来的作者时间）和 `live`（首次入库时刻），
+        两者都可信；`backfill` 是从 mtime 灌的，不可信，跳过。
+
+        兜底才扫正文：迁移之前的老卡，那一行还在。
+        """
+        row = self._rec_db(path)
+        if row:
+            ts, src = row
+            if src in ("card", "live"):
+                return "记于 " + time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(ts)
+                ) + f"（{self._ago(ts)}）"
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                # 用 islice 而不是 `[next(fh) for _ in range(40)]`：后者对
+                # **不足 40 行**的文件会抛 StopIteration，整个读取被判失败 ——
+                # 实测 2475 个短卡（26%）的「记于」因此从来没显示过。
+                head = list(islice(fh, 40))
+        except Exception:  # noqa: BLE001
+            return ""
+        for line in head:
+            m = self._TIME_PAT.search(line)
+            if not m:
+                continue
+            _key, y, mo, d, hh, mm = m.groups()
+            try:
+                ts = datetime.datetime(
+                    int(y), int(mo), int(d), int(hh or 0), int(mm or 0)
+                ).timestamp()
+            except Exception:  # noqa: BLE001 —— 日期非法就当没写
+                continue
+            stamp = f"{y}-{mo}-{d}" + (f" {hh}:{mm}" if hh else "")
+            return f"记于 {stamp}（{self._ago(ts)}）"
+        return ""
+
+    def _intersect(self, path: str, times, lo: int, hi: int):
+        """把 ``[lo, hi]`` 与各节行范围求交 → ``{行范围: (last_changed, source)}``。
+
+        按**行范围**收桶而不是按 heading_path：老数据把「(Part 2)」拼在标题里，
+        同一节的三片成了三个不同的 heading_path、行范围却完全一样 —— 按 key
+        数算会虚报「读到 3 节」，其实是同一节。
+
+        再剔除被别的命中范围**完全包住**的父节：读「避坑铁律」时 H1 那节
+        （范围 = 全文）必然也命中，但它只是外框，不是读到的内容。不剔的话
+        永远至少报 2 节，时间也总被 H1 拉走。
+        """
+        out = self._outline(path)
+        by_title, end_map = out["by_title"], out["end"]
+        buckets = {}
+        for hp, val in times.items():
+            chain = self._heading_chain(hp)
+            if not chain:
+                continue
+            # 预筛：末级标题在文件里的**所有**出现位置都落在 [lo, hi] 之外，
+            # 这一节必然不相交，不必为它跑逐级收窄。6643 节的卡靠这一步把
+            # 1.6s 降到几十 ms —— 末级范围是收窄后的超集，所以这个判断只会
+            # 提前排除「本来就不相交」的节，不会误杀相交的。
+            cands = by_title.get(self._clean_heading(chain[-1]))
+            if cands and not any(
+                not (hi < i + 1 or lo > end_map[i]) for i, _ix in cands
+            ):
+                continue
+            start = n = 0
+            # 取**最后一个算得出范围**的层级：末级对不上时 `_chain_spans` 给
+            # (0,0,0)，退回上一级仍有意义的范围，比整卡瞎猜准。
+            spans = self._chain_spans(path, chain)
+            for _c, _s, _n in reversed(spans):
+                if _s and _n:
+                    start, n = _s, _n
+                    break
+            if start and n:
+                if hi < start or lo > start + n - 1:
+                    continue
+                key = (start, n)
+            else:
+                # 算不出范围（标题被改过 / 分隔符不认识）→ 当作整卡命中。
+                # 宁可多算，也不让这节的时间凭空消失；合并成一桶，不计数。
+                key = (0, 0)
+            prev = buckets.get(key)
+            if prev is None or (val[0] or 0) > (prev[0] or 0):
+                buckets[key] = val
+
+        items = list(buckets.items())
+        kept = [
+            (sp, v)
+            for i, (sp, v) in enumerate(items)
+            if not sp[0]
+            or not any(
+                sp2[0]
+                and sp2[0] >= sp[0]
+                and sp2[0] + sp2[1] <= sp[0] + sp[1]
+                and sp2[1] < sp[1]
+                for j, (sp2, _v) in enumerate(items)
+                if j != i
+            )
+        ]
+        return dict(kept or items)
+
+    def _rev_text(self, path: str, offset: Any = None, limit: Any = None) -> str:
+        """「修订 …」：读到的节里，最新的那片内容变化时刻。
+
+        整卡（没传 offset/limit）走快路径：所有节都算读到，直接取最大值，
+        不必为每节算一遍行范围 —— 一张 60 节的卡能省 60 次 `_chain_spans`。
+        """
+        times = self._chunk_times(path)
+        if not times:
+            return ""
+
+        if offset is None and limit is None:
+            picked = list(times.values())
+            # 节数只用于文案，按分隔符判断深度即可 —— 逐条 split_heading_path
+            # 本身就是分钟级的开销（6643 节实测）。
+            nested = sum(1 for hp in times if "\x1f" in hp or " > " in hp)
+            n_sections = nested if nested else len(times)
+        else:
+            lo, hi = 1, 10 ** 9
+            try:
+                if offset is not None:
+                    lo = max(1, int(offset))
+                if limit is not None:
+                    hi = lo + max(1, int(limit)) - 1
+            except Exception:  # noqa: BLE001 —— 参数不像数就当整卡
+                lo, hi = 1, 10 ** 9
+            buckets = self._intersect(path, times, lo, hi)
+            picked = list(buckets.values())
+            # (0,0) 是「算不出范围」的兜底桶，不参与计数。
+            n_sections = sum(1 for k in buckets if k[0])
+
+        best = max((c for c, _s in picked if c), default=0.0)
+        if not best:
+            return ""
+        src = next((s for c, s in picked if c == best), "")
+        rev = "修订 " + time.strftime(
+            "%m-%d %H:%M", time.localtime(float(best))
+        ) + f"（{self._ago(float(best))}）"
+        if n_sections > 1:
+            rev = f"读到 {n_sections} 节，最新" + rev
+        if (src or "") == "backfill":
+            rev += "，待确认"
+        return rev
 
     def _disk(self, file_path: str) -> Tuple[str, int]:
         """读磁盘原文 → ``(全文, 行数)``，同一屏多块共用一次读。
@@ -297,17 +577,39 @@ class KBAutoInjectPlugin:
         disk = self._disk(file_path)[0]
         lines = disk.split("\n") if disk else []
         heads = scan_heads(lines)
-        # 每个标题的节结束行：往下第一个级别不高于它的标题；没有就是文件尾。
+        n = len(lines)
+
+        # 每个标题的节结束行：单调栈，O(标题数)。早先是「每个标题都往后
+        # 扫一遍、找第一个级别不高于它的」的双层循环 —— 1846 个标题要 340 万
+        # 次比较，一本小说光这里就 119ms；而且 `heads[k+1:]` 每轮都在复制切片。
         end: Dict[int, int] = {}
-        for k, (i, lvl, _t) in enumerate(heads):
-            stop = len(lines)
-            for j, lvl2, _t2 in heads[k + 1:]:
-                if lvl2 <= lvl:
-                    stop = j
-                    break
-            end[i] = stop
-        out = {"lines": len(lines), "heads": heads, "end": end,
-               "level": {i: lvl for i, lvl, _t in heads}}
+        stack: List[Tuple[int, int]] = []          # [(级别, 行下标)]
+        for i, lvl, _t in heads:
+            while stack and stack[-1][0] >= lvl:
+                _lv, _li = stack.pop()
+                end[_li] = i
+            stack.append((lvl, i))
+        for _lv, _li in stack:
+            end[_li] = n
+
+        # 每节字符数一次算好。**这一条是性能的关键**：`_chain_spans` 早先每次
+        # 调用都 `self._disk(...).split("\n")` 一遍全文，7.3MB 文本 split 一次
+        # 79.8ms —— `_span_cache` 是按「链」缓存的，6643 个不同的链全 miss，
+        # 于是同一份文本被 split 了 6643 次，实测把一次读取拖到 504 秒。
+        pre = [0] * (n + 1)
+        for k, x in enumerate(lines):
+            pre[k + 1] = pre[k] + len(x) + 1
+        chars = {i: pre[e] - pre[i] for i, e in end.items()}
+
+        # 标题文本 → [(行下标, heads 下标)]，按行序。`_chain_spans` 每级都要
+        # 「在 [lo, hi) 里找这个标题」，逐条扫 1846 个标题再乘 6643 节是千万级；
+        # 有这张表就是一次二分。
+        by_title: Dict[str, List[Tuple[int, int]]] = {}
+        for idx, (i, _lvl, txt) in enumerate(heads):
+            by_title.setdefault(txt, []).append((i, idx))
+
+        out = {"lines": n, "heads": heads, "end": end, "chars": chars,
+               "by_title": by_title, "level": {i: lvl for i, lvl, _t in heads}}
         self._outline_cache[file_path] = out
         return out
 
@@ -380,7 +682,6 @@ class KBAutoInjectPlugin:
                 continue
             seen[key] = len(menu)
             content = str(chunk.get("content") or "")
-            total, blocks = self._card_size(fp)
             geo = self._locate(fp, content)
             # 卡标题行印的「行 a~b」必须是**这张卡自己**的范围，不是整个文件。
             # 一个 .md 里可以塞好几张卡（实测 441 份文件装 1,048 张），第二张卡从
@@ -392,9 +693,7 @@ class KBAutoInjectPlugin:
             _cs, _cl = 0, 0
             if _h1:
                 _sp = self._chain_spans(fp, [_h1]) or [(0, 0, 0)]
-                _sz, _cs, _cl = _sp[0]
-                if _cs:
-                    total = _sz or total
+                _, _cs, _cl = _sp[0]
             if not _cs:
                 _cs, _cl = 1, self._file_lines(fp)
             menu.append({
@@ -404,17 +703,132 @@ class KBAutoInjectPlugin:
                 # 这张卡的全部命中落点（含首块）：[{chain, a, n}, ...]。
                 # chain 是完整标题链（不含 H1），渲染层按它合并成树。
                 "hits": [hit] if hit else [],
-                # 体量：整卡字数 / 块数 / 整卡行数 —— 决定「一次读完」还是「只读命中段」
-                "total": total,
-                "blocks": blocks,
+                # 体量只留行数：字数是行数的派生量，卡片行已经不印了，也不必再查库。
                 # total_lines 是**这张卡**的行数（一文件多卡时不含别的卡），
                 # card_start 是它在文件里的起始行，渲染层拼成「行 a~b」。
                 "total_lines": _cl,
                 "card_start": _cs,
                 # 绝对路径：read_file 的唯一入口
                 "path": fp,
+                # 原始首段（未归一）。兜底时要区分「假 H1」和「文件名回退」：
+                # 后者本来就没有可定位的标题行，改了会跟文件里第一张真卡撞 key。
+                "_h1": _h1,
             })
-        return menu
+        # 标题兜底：切分器不认代码围栏，会把代码块里的 `# 注释` 写成 `chunk.h1`
+        # （实测某块 `h1` 就是 ``reindexed: 0 files / 0 chunks`` —— 文件第 6983 行
+        # 一个 bash 块里的一行）。这种标题在 `_outline` 的骨架里定位不到，而骨架
+        # **只认围栏外的标题**，所以「定位不到」本身就是干净的判据：退回文件首个
+        # H1，那张「卡」于是并回它本来属于的那张卡。
+        for m in menu:
+            fp0 = str(m.get("path") or "")
+            _t = str(m.get("title") or "")
+            _raw = str(m.get("_h1") or "")
+            # 判「这张卡的起点是不是真的本文件一级标题」：
+            # - 级别 1 → 就是主卡，不动（一文件多卡靠这条保住）；
+            # - 级别 ≥2 → 切分器拿 `## 小节` 当了卡起点，它属于文件首个 H1 那张卡；
+            # - 级别 0 且首段 >8 字 → 代码块里的 `# 注释`（假 H1），同上去；
+            # - 级别 0 且首段 ≤8 字 → `_card_title` 退回文件名，本来没有标题行，别动
+            #   （实测 `SKILL.md` 里「SKILL」被兜底成文件首个 H1，把两张卡合成了一张）。
+            if not _raw or _t != _raw:
+                continue
+            _lvl = self._title_level(fp0, _t)
+            if _lvl == 1 or (_lvl == 0 and len(_raw) <= 8):
+                continue
+            _first = next(
+                (t for _i, _l, t in (self._outline(fp0).get("heads") or []) if _l == 1),
+                "",
+            )
+            if _first:
+                m["title"] = _first
+                m["key"] = (fp0, _first)
+        return self._merge_menus(menu)
+
+    def _title_pos(self, fp: str, title: str) -> int:
+        """这个标题在原文里作为标题行的起始行；定位不到返回 0。"""
+        if not fp or not title:
+            return 0
+        try:
+            sp = self._chain_spans(fp, [self._clean_heading(title)])
+        except Exception:  # noqa: BLE001 —— 定位失败不该让整屏渲染炸掉
+            return 0
+        return int(sp[0][1]) if sp else 0
+
+    def _title_level(self, fp: str, title: str) -> int:
+        """这个标题在骨架里的级别（1 = 一级标题）；定位不到返回 0。
+
+        用来区分三种「卡标题」：真 H1（1）、切分器拿 `## 小节` 当卡起点（≥2）、
+        代码块里的 `# 注释`（0，骨架围栏感知，认不到）。
+        """
+        if not fp or not title:
+            return 0
+        want = self._clean_heading(title)
+        for _i, lvl, txt in (self._outline(fp).get("heads") or []):
+            if txt == want:
+                return int(lvl)
+        return 0
+
+    def _merge_menus(self, menus: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """多批清单 → 一屏：同一张卡只留一行，命中落点取并集。
+
+        `_build_menu` 的去重只在**单批内**有效 —— 批与批之间互相看不见。批数闸
+        删掉之后一次可能投十几批，同一张卡在好几批里各命中一次的概率反而更高；
+        不合并的话那张卡会在屏上出现两三次，每棵树只带自己那一批的落点，模型
+        会当成不同的卡分别去读。
+
+        判同卡三条，从严到松：
+        1. `key`（路径 + 卡标题）相同；
+        2. 路径相同、两个标题互相包含（老数据缺 `h1` 列时标题由 `heading_path`
+           反推，同一张卡的不同块可能推出长短两种写法）；
+        3. 路径相同、`card_start` 相同 —— 一条兜底：切分器**不认代码围栏**，
+           会把代码块里的 `# 注释` 当成 H1（实测某块 `h1` 列就是
+           ``reindexed: 0 files / 0 chunks``，那是文件第 6983 行 bash 块里的一行）。
+           这种「卡」没有自己的范围，整块都落在主卡里，只能是主卡的一部分。
+
+        标题取「在原文里更靠前」的那个：上面那种假 H1 的行号在文件后半段，
+        不该抢走主卡的名字。
+        """
+        out: List[Dict[str, Any]] = []
+        for m in menus:
+            fp = str(m.get("path") or "")
+            title = str(m.get("title") or "")
+            _cs = int(m.get("card_start") or 0)
+            idx = -1
+            for i, base in enumerate(out):
+                if base.get("key") == m.get("key"):
+                    idx = i
+                    break
+                if not fp or str(base.get("path") or "") != fp:
+                    continue
+                bt = str(base.get("title") or "")
+                _bp2 = self._title_pos(fp, bt)
+                _mp2 = self._title_pos(fp, title)
+                # 标题互相包含：两条都**能定位到标题行**时才认。否则
+                # 「SKILL.md」和「SKILL」这种前缀关系会把两张不同的卡合掉。
+                if bt and title and _bp2 and _mp2 and (bt in title or title in bt):
+                    idx = i
+                    break
+                # 同坐标兜底：只在「一边定位得到、一边定位不到」时启用。
+                # 定位不到的那半是切分器写坏的假 H1（代码块里的 `# 注释`），
+                # 它的 `card_start` 只能回退成 1，本身没有可信坐标；两条都
+                # 定位不到就说明是另一个问题，宁可分开也别混成一棵树。
+                if _cs and int(base.get("card_start") or 0) == _cs and bool(_bp2) != bool(_mp2):
+                    idx = i
+                    break
+            if idx < 0:
+                out.append(m)
+                continue
+            base = out[idx]
+            _bp, _mp = self._title_pos(fp, str(base.get("title") or "")), self._title_pos(fp, title)
+            if _mp and (not _bp or _mp < _bp):
+                base["title"] = title
+            _have = {(int(h.get("a") or 0), int(h.get("n") or 0))
+                     for h in base.get("hits") or []}
+            for h in m.get("hits") or []:
+                _k = (int(h.get("a") or 0), int(h.get("n") or 0))
+                if _k not in _have:
+                    base["hits"].append(h)
+                    _have.add(_k)
+        return out
 
     def _chunk_hit(self, chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """一个命中块的落点：``{chain, a, n}`` —— 完整标题链 + 命中段行范围。
@@ -482,6 +896,11 @@ class KBAutoInjectPlugin:
         return segs
 
     @staticmethod
+    def _rng(a: int, n: int) -> str:
+        """行范围。单行印一个数；多行印 ``a~b``，行数由 `b - a + 1` 算得出来，不重复写。"""
+        return f"行 {a}" if int(n) <= 1 else f"行 {a}~{int(a) + int(n) - 1}"
+
+    @staticmethod
     def _clean_heading(text: str) -> str:
         """标题文本去装饰，标题链和磁盘原文两边都过一遍才能比对上。
 
@@ -522,10 +941,10 @@ class KBAutoInjectPlugin:
         if _cached is not None:
             return list(_cached)
         out = self._outline(file_path)
-        lines = self._disk(file_path)[0].split("\n") if out["lines"] else []
         heads = out["heads"]
+        n = out["lines"]
         spans: List[Tuple[int, int, int]] = []
-        lo, hi = 0, len(lines)
+        lo, hi = 0, n
 
         def _find(want_: str, lo_: int, hi_: int) -> int:
             """在 ``[lo_, hi_)`` 行内找这个标题，**返回最贴近的那个**。
@@ -540,15 +959,18 @@ class KBAutoInjectPlugin:
             是两个不同小节，找「改法：一卡一行」时先撞上兄弟节点「改法」就返回了，
             于是行范围指到别的小节（实测把 6734~6777 标成 5277~5293）。
             """
-            exact, loose = -1, -1
+            lst = out["by_title"].get(want_)
+            if lst:
+                k = bisect.bisect_left(lst, (lo_, -1))
+                if k < len(lst) and lst[k][0] < hi_:
+                    return lst[k][1]
+            loose = -1
             for idx, (i, _lvl, txt) in enumerate(heads):
                 if i < lo_ or i >= hi_:
                     continue
-                if txt == want_:
-                    return idx
                 if loose < 0 and (txt.startswith(want_) or want_.startswith(txt)):
                     loose = idx
-            return exact if exact >= 0 else loose
+            return loose
 
         for want in chain:
             want = self._clean_heading(want)
@@ -561,16 +983,16 @@ class KBAutoInjectPlugin:
                 # 模型照着抄就是读到不相干的内容。
                 # 宁可这一段标 (0,0,0) 不印行号，也不给一个会让人读错的坐标。
                 spans.append((0, 0, 0))
-                lo, hi = 0, len(lines)
+                lo, hi = 0, n
                 continue
             i, _lvl, _txt = heads[hit]
             end = out["end"][i]        # 骨架里已算好：下一个同级或更高级的标题
-            spans.append((sum(len(x) + 1 for x in lines[i:end]), i + 1, end - i))
+            spans.append((out["chars"][i], i + 1, end - i))
             lo, hi = i + 1, end
         self._span_cache[_ck] = tuple(spans)
         return spans
 
-    def _render_menu(self, menu: List[Dict[str, Any]], query: str = "") -> str:
+    def _render_menu(self, menu: List[Dict[str, Any]]) -> str:
         """标题清单：卡标题 + 命中小节 + **可直接喂给 `read_file` 的行号**。
 
         刻意不印 gate 分（全挤在 0.99xx，纯噪音）、不印 chunk_id（4 位前缀 36.42% 碰撞）。
@@ -681,16 +1103,16 @@ class KBAutoInjectPlugin:
                     if kind == "kid":
                         k = val
                         ksegs = segs + [k["seg"]]
-                        sz, a, n = _span(ksegs)
-                        tag = f" · {sz:,} 字" if sz else ""
-                        if n:
-                            tag += f" · 行 {a}~{a + n - 1}（{n} 行）"
+                        _chars, a, n = _span(ksegs)
+                        # 不印字数：判断「整节读还是只读命中段」看行范围就够，
+                        # 字数是它的派生量，两个数说同一件事只占地方。
+                        tag = f" · {self._rng(a, n)}" if n else ""
                         out.append(f"{_mark(prefix, last)}{k['seg']}{tag}")
                         walk(k, child_prefix, ksegs)
                     elif kind == "leaf":
                         a, n = val
                         out.append(f"{_mark(prefix, last)}"
-                                   f"命中段 行 {a}~{a + n - 1}（{n} 行）")
+                                   f"命中段 {self._rng(a, n)}")
                     else:
                         out.append(f"{_mark(prefix, last)}路径：{val}")
 
@@ -703,24 +1125,13 @@ class KBAutoInjectPlugin:
             # 不再印 `#N`：序号本来就是去重账本的产物（同一张卡永远同一个号），
             # 账本删了，序号也就没有意义 —— 认卡靠标题和路径。
             out = m["title"]
-            total = int(m.get("total") or 0)
             tl = int(m.get("total_lines") or 0)
             cs = int(m.get("card_start") or 1) or 1
-            vol = []
-            if total:
-                vol.append(f"{total:,} 字")
+            # 只印行范围。起点未必是 1 —— 一个文件里可以有好几张卡，第二张从自己的
+            # H1 起算。不印字数、不加「别整读」这类命令，怎么读是模型自己的判断。
             if tl:
-                # 和每一级同款：整卡就是「行 a~b（n 行）」，不搞特殊措辞。
-                # 起点未必是 1 —— 一个文件里可以有好几张卡，第二张从自己的 H1 起算。
-                # 只印数，不加「别整读」这类命令，怎么读是模型自己的判断。
-                vol.append(f"行 {cs}~{cs + tl - 1}（{tl} 行）")
-            if vol:
-                out += " · " + " · ".join(vol)
-            _hits = m.get("hits") or []
-            if len(_hits) > 1:
-                # 这张卡命中多处时点一句，模型一眼知道「不止一处对题」，不会读完
-                # 第一段就收工。只命中一处不必说 —— 那是默认形态，说了是噪音。
-                out += f" · 命中 {len(_hits)} 处"
+                out += f" · {self._rng(cs, tl)}"
+            # 不印「命中 N 处」：树里几个「命中段」就是几处，同一件事说两遍只占地方。
             out += _hit_tree(m)
             # 路径行由 `_hit_tree` 统一收口（它要参与树的孩子排序才能只有一个 `└`）。
             # 没有命中落点时（定位全失败）树是空的，这里兜底补一行，否则这卡没有入口。
@@ -729,20 +1140,14 @@ class KBAutoInjectPlugin:
             return out
 
         lines = "\n".join(_row(m) for m in menu)
-        # 抬头报**卡数**：每行一张卡（老卡有新落点时重印的仍是同一张卡，不会重复计数）。
-        # 检索词印在自己这一屏的抬头里：多词合并时每屏各带各的词，模型能对上
-        # 「这批卡是按什么捞的」。不另传一份词表 —— 那会多出一个判据、多一种形态。
-        _q = (query or "").strip()
-        head = f"知识库检索到 {len({m['key'] for m in menu})} 个相关知识块"
-        if _q:
-            head += f"（检索词：{_q if len(_q) <= 40 else _q[:40] + '…'}）"
-        head += "。"
+        # 抬头只报**卡数**。不印检索词：一屏可能由十几批拼成，各带各的词，
+        # 印出来是一串重复的噪声；词本身在每条检索日志里都有 `q=…`，要查查日志。
+        head = f"知识库检索到 {len({m['key'] for m in menu})} 个相关知识块。"
         return (
             "<knowledge-base-titles>\n"
             f"{head}\n"
-            "读法：照抄行号 —— `read_file(路径, offset=起行, limit=行数)`。"
-            "**卡标题下逐级缩进就是命中处的小节路径，每行末尾的「行 a~b」是该级的完整范围，想读整级就抄它**；"
-            "最末一级下面若另起一行标「命中段」，说明命中只是那一级的一部分。\n"
+            "读法：`read_file(路径, offset=起行, limit=止行-起行+1)`；缩进是小节路径，"
+            "标「命中段」的那行只是该节的一部分。\n"
             f"{lines}\n"
             "</knowledge-base-titles>"
         )
@@ -867,7 +1272,7 @@ class KBAutoInjectPlugin:
             sum(len(m.get("hits") or []) for m in _menu),
             _short(_q, 70),
         )
-        return self._render_menu(_menu, _q)
+        return self._render_menu(_menu)
 
     # ============ 唯一的提交口 ============
     #
@@ -950,15 +1355,60 @@ class KBAutoInjectPlugin:
         真正的「新旧」由 ``handle_llm_request`` 用检索词在提示词里的位置判定。
         """
         _sid = session_id or "default"
-        _menu = self._menu_from_chunks(query, chunks)
+        # 槽里存**结构化菜单**而不是渲染好的字符串：同一张卡可能在两批里各命中一次，
+        # 只有拿到结构才能在出口合成一棵树。渲染推迟到出口那一处（见 `_merge_menus`）。
+        _menu = self._build_menu(chunks) if chunks else []
         if not _menu:
             return
         with self._pending_lock:
             self._pending.setdefault(_sid, []).append((seq, query, _menu))
         logger.info(
-            "[KBAutoInject] pending MENU chars=%d q=%s sid=%s",
+            "[KBAutoInject] pending MENU cards=%d q=%s sid=%s",
             len(_menu), _short(query, 60), _sid[:26],
         )
+
+    def handle_transform_tool_result(
+        self, tool_name: str = "", args: Any = None, result: Any = None, **kwargs: Any
+    ) -> Optional[str]:
+        """读正文时补一行「这张卡什么时候写的」（`transform_tool_result` 钩子）。
+
+        清单里不印时间（清单要干净），但 AI 常常**只读命中段**、跳过卡头那行
+        「记录时间」—— 于是它对「这条知识是三个月前的」毫无感觉。这里在真正的
+        正文读取出口补上：只认 `read_file` + **库内文件**，别的工具/路径一律
+        返回 None（None = 原样放行）。
+
+        加的是返回 JSON 里的一个新字段 `kb_card`，**`content` 一个字不碰**：
+        content 每行带 `行号|` 前缀，往里插一行会让后面所有行号错位。
+        """
+        if tool_name != "read_file" or not isinstance(result, str):
+            return None
+        # 工具自己失败了（文件不存在 / 权限 / 目录），读到的不可能是正文。
+        # `status` 缺失时按成功处理 —— 宁多加一行，不因缺字段就不加。
+        if str(kwargs.get("status") or "ok").strip().lower() != "ok":
+            return None
+        try:
+            raw = str((args or {}).get("path") or "")
+        except Exception:  # noqa: BLE001
+            return None
+        if not raw:
+            return None
+        path = os.path.abspath(os.path.expanduser(raw))
+        try:
+            if self._chunk_times(path) is None:
+                return None
+            info = self._card_time_text(
+                path, (args or {}).get("offset"), (args or {}).get("limit")
+            )
+            if not info:
+                return None
+            obj = json.loads(result)
+            if not isinstance(obj, dict) or "kb_card" in obj:
+                return None
+            obj["kb_card"] = info
+            return json.dumps(obj, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 —— 补时间失败不该让读文件失败
+            logger.debug("[KBAutoInject] kb_card skip %s: %s", raw, exc)
+            return None
 
     def handle_llm_request(
         self, request: Any = None, session_id: str = "", **kwargs: Any
@@ -979,28 +1429,26 @@ class KBAutoInjectPlugin:
                 return None
             # 按「检索词在提示词里的位置」排，位置相同再按提交序号兜底。
             # 不按完成时间、也不单独按提交序号：并行段里两者都会错位。
+            # 排序只决定拼接顺序（越新越靠后），不再用来截断。
             _slot.sort(key=lambda item: (self._prompt_rank(request, item[1]), item[0]))
-            # 容量闸：只在超过硬上限时从**最旧**一端删，防无界积压。
-            # 这里不参与「投谁」的决策 —— 投递顺序永远只看新鲜度。
-            _dropped = 0
-            if len(_slot) > self._MAX_PENDING_SLOTS:
-                _dropped = len(_slot) - self._MAX_PENDING_SLOTS
-                del _slot[:_dropped]
-            # 永远投提示词里最新的 N 批，与积压深度无关。
-            _take = _slot[-self._MAX_MERGED_MENUS:]
-            del _slot[-self._MAX_MERGED_MENUS:]
-            _queued = len(_slot)
-            if not _slot:
-                self._pending.pop(_sid, None)
-        _block = "\n\n".join(text for _, _, text in _take)
+            # 槽里攒了多少就投多少：检索成本已经付过，没有理由再按「批数」筛一遍。
+            # 全投 ⇒ 槽每次请求后必空，积压与丢弃这两个概念一并消失。
+            _take = list(_slot)
+            _slot.clear()
+            self._pending.pop(_sid, None)
+        # 多批 → 一屏。同一张卡在两批里各命中一次时，这里合并成一行一棵树：
+        # `_build_menu` 只能在**单批内**去重（批与批互相看不见），而批数闸删掉后
+        # 一次可能投十几批，同一张卡重复出现的概率反而变高。
+        _merged = self._merge_menus([m for _, _, mm in _take for m in mm])
+        _block = self._render_menu(_merged)
         if not _append_to_last_message(request, _block):
             # 没拼进去就放回槽，下次还有机会 —— 注入失败不等于这批数据作废。
             with self._pending_lock:
                 self._pending.setdefault(_sid, []).extend(_take)
             return None
         logger.info(
-            "[KBAutoInject] llm_request INJECT batches=%d chars=%d queued=%d dropped=%d sid=%s",
-            len(_take), len(_block), _queued, _dropped, _sid[:26],
+            "[KBAutoInject] llm_request INJECT batches=%d cards=%d chars=%d sid=%s",
+            len(_take), len(_merged), len(_block), _sid[:26],
         )
         return {
             "request": request,
