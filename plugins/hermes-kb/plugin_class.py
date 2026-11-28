@@ -1487,6 +1487,9 @@ class KBAutoInjectPlugin:
 
         _emit: Dict[str, Tuple[str, Dict[str, Any]]] = {}
         _skipped = 0
+        # 惰性扫一次「本轮已经读过哪些区间」：只有遇到**本轮没见过的卡**才需要它。
+        # 卡已经在表里时完全不碰 messages。
+        _spans: Optional[List[Tuple[str, int, int]]] = None
         for _, _q, _menu in _take:
             # `_build_menu` 的产物已经是一张卡一条，单批内不必再合并。
             for _item in _menu:
@@ -1507,6 +1510,13 @@ class KBAutoInjectPlugin:
                         int(_item.get("total_lines") or 1),
                         bool(_item.get("span_exact", True)),
                     ]
+                    # 「投之前就已经读过」的补判点：模型可能先从 `search_knowledge`
+                    # 的清单里读了它，那时它还没进表，钩子无处可标。补判只看本轮
+                    # （最后一个 user 之后），所以不会把往轮读过的当成已读。
+                    if _spans is None:
+                        _spans = self._read_spans(request.get("messages"))
+                    if self._is_read(_item, _spans):
+                        rec[0] = self._READ
                 if rec[0] == self._READ:
                     # 本轮读过正文了，这一屏不再给它位置。
                     _skipped += 1
@@ -1544,6 +1554,95 @@ class KBAutoInjectPlugin:
             "name": "hermes-kb-auto-inject",
             "reason": "kb titles tail inject (ladder)",
         }
+
+    @staticmethod
+    def _read_spans(messages: Any) -> List[Tuple[str, int, int]]:
+        """本轮真读过的「(绝对路径, 起行, 止行)」，只认 `read_file`，只扫最后一个 user 之后。
+
+        钩子（`_mark_read`）管「**投过之后**的读」；这里管「**投之前**的读」——
+        模型可能先从 `search_knowledge` 的清单里读了卡，而那张卡当时还没进 `_ladder`
+        （那条路的 handler 拿不到 `turn_id`，钩子没法提前建格子）。等它第一次被阶梯
+        判到时补判一次，就能落到 `_READ`。
+
+        为什么不另存一份账：`read_file` 的 tool_call 本来就在本轮请求里，是既成事实；
+        抄一份等于复制同一事实，还会跟压缩后的历史对不上。只扫**最后一个 user 之后**，
+        所以往轮读过的不算 —— 不是永久压制。找不到 user 消息返回空，宁可多贴一次。
+        """
+        if not isinstance(messages, list) or not messages:
+            return []
+        start = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                start = idx
+                break
+        if start is None:
+            return []
+        spans: List[Tuple[str, int, int]] = []
+        for msg in messages[start:]:
+            if not isinstance(msg, dict):
+                continue
+            calls = msg.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(fn, dict):
+                    continue
+                if str(fn.get("name") or "").strip() != "read_file":
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except (ValueError, TypeError):
+                        continue
+                if not isinstance(raw_args, dict):
+                    continue
+                raw = str(raw_args.get("path") or "").strip()
+                if not raw:
+                    continue
+                try:
+                    off = raw_args.get("offset")
+                    off = int(off) if off not in (None, "") else 1
+                    lim = raw_args.get("limit")
+                    lim = int(lim) if lim not in (None, "") else 2000
+                except (TypeError, ValueError):
+                    off, lim = 1, 2000
+                if off < 1 or lim < 1:
+                    continue
+                spans.append(
+                    (os.path.abspath(os.path.expanduser(raw)), off, off + lim - 1)
+                )
+        return spans
+
+    @staticmethod
+    def _is_read(item: Dict[str, Any], spans: List[Tuple[str, int, int]]) -> bool:
+        """这张**卡**的行区间有没有被读过（不是「这个文件被读过」）。
+
+        一个 `.md` 能装好几张卡（实测 441 份文件装 1,048 张），只比路径会把同文件的
+        兄弟卡一起判成已读 —— 那才是静默丢知识。区间退化成整文件（`span_exact=False`）
+        时同样不判，理由相同。
+        """
+        if not spans:
+            return False
+        if not item.get("span_exact", True):
+            return False
+        raw = str(item.get("path") or "").strip()
+        if not raw:
+            return False
+        path = os.path.abspath(os.path.expanduser(raw))
+        try:
+            first = int(item.get("card_start") or 1)
+            count = int(item.get("total_lines") or 1)
+        except (TypeError, ValueError):
+            return False
+        lo = max(1, first)
+        hi = lo + max(1, count) - 1
+        for seen_path, a, b in spans:
+            if seen_path == path and a <= hi and b >= lo:
+                return True
+        return False
 
     def _mark_read(self, tool_name: str, args: Any = None, **kwargs: Any) -> None:
         """读取发生的那一刻就记账：这张卡本轮读过了。
