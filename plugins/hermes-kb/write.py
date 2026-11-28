@@ -1941,12 +1941,12 @@ def _drain_pending_receipts(agent: Any) -> None:
     # 2026-11-25：多条合并成一条气泡。一轮里写几张卡就刷几条「已补充」，
     # 实测一次例行维护能连发 10 条，用户看到的是通知淹没正文。合并成一条带行
     # 的汇总，反馈还在，但只占一条位置。
-    if len(mine) > 1:
-        # 2026-11-25（二轮）：平铺 `· 原文` 换成按卡片聚合的 markdown 摘要，
-        # 见 _render_receipt_digest 的说明。
-        out = _render_receipt_digest(mine)
-    else:
-        out = mine[0]
+    # 2026-11-28：单条也不再走原样。原来 `len(mine) > 1` 才聚合、否则发 `mine[0]`，
+    # 于是同样是写卡，写一张是 `📝 已沉淀反思卡《X》 · 症状`、写两张变成
+    # `📚 知识库本轮更新 · N 处` 的表 —— 一个人同一件事两种脸。这里统一交给
+    # `_render_receipt_digest`：它本身就是按条目数自适应的（单条渲染成
+    # `知识库本轮更新 · 1 处` 加一行卡名一行动作），不需要调用侧再分支。
+    out = _render_receipt_digest(mine)
     with suppress(Exception):
         agent._safe_print(out)
     if cb:
