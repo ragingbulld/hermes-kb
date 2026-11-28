@@ -50,6 +50,58 @@ TOOL_EMOJI = {
     "delete_reflection_card": "🗑️",  # 垃圾桶：删卡（唯一不可恢复的出口）
 }
 
+# ── 工具行的中文动词（gateway / Desktop 显示成「✏️ 编辑反思卡 …」）──────────────
+# 工具行是 `f"{emoji} {verb}{connector}{preview}"`，`verb` 来自
+# `agent.display.get_tool_verb()`；而那个函数只对核心白名单 `_TOOL_VERB_TOOLS` 里的
+# 24 个内置工具查 catalog，插件工具一律返回 None → 回落到
+# `gateway.progress.tool_preview` 模板，渲染成「✏️ edit_reflection_card："卡名"」。
+# `register_tool()` 只有 `emoji=`，没有显示名字段，所以插件没法"登记"。
+#
+# 在这里补两层，都不落盘改核心：
+#   ① 名字并进白名单（换新 frozenset，不原地 mutate；进程重启后插件重新加载会再并一次，
+#      `hermes update` 覆盖不到）；
+#   ② 用公开的 `agent.i18n_layers.register_pack()` 注册 `display.verb.*`。
+#
+# 两种语言都得注册：`t()` 对未命中的 key 返回 **key 本身**，只注册 zh 时把
+# `display.language` 切到 en 会显示「✏️ display.verb.edit_reflection_card」，比现在更糟。
+# en 用工具原名，等于维持现状。
+TOOL_VERB = {
+    "search_knowledge": ("检索知识库", "search_knowledge"),
+    "save_reflection": ("沉淀反思卡", "save_reflection"),
+    "edit_reflection_card": ("编辑反思卡", "edit_reflection_card"),
+    "delete_reflection_card": ("删除反思卡", "delete_reflection_card"),
+}
+_VERB_PACK_SOURCE = "hermes-kb"
+
+
+def _install_tool_verbs() -> None:
+    """把四个 KB 工具接进 gateway 的友好标签链（白名单 + i18n pack）。"""
+    try:
+        from agent import display as _display
+        from agent import i18n_layers as _layers
+    except Exception as exc:          # 独立脚本 / 无 gateway 上下文
+        logger.debug("[KBWrite] tool verb install skipped: %s", exc)
+        return
+    names = frozenset(TOOL_VERB)
+    if not names <= _display._TOOL_VERB_TOOLS:
+        _display._TOOL_VERB_TOOLS = _display._TOOL_VERB_TOOLS | names
+    reused = any(getattr(p, "source", "") == _VERB_PACK_SOURCE for p in _layers._packs)
+    if not reused:                    # 热重载会重复走 register()，pack 只注册一次
+        _layers.register_pack(
+            "zh", "core",
+            {f"display.verb.{k}": v[0] for k, v in TOOL_VERB.items()},
+            source=_VERB_PACK_SOURCE,
+        )
+        _layers.register_pack(
+            "en", "core",
+            {f"display.verb.{k}": v[1] for k, v in TOOL_VERB.items()},
+            source=_VERB_PACK_SOURCE,
+        )
+    # probe 问的是「此刻在网关进程里真查一遍」的结果，不是刚写进去的那份
+    logger.info("[KBWrite] tool verbs %s for %d tools (probe: %r)",
+                "reused" if reused else "installed", len(TOOL_VERB),
+                _display.get_tool_verb("edit_reflection_card"))
+
 # ── KB 规约路径（与 hermes-kb-reflection 保持一致，双根镜像） ──────────────────
 # 开源仓库版：路径不写死，由部署方用环境变量指定。生产环境里两处可指向同一个
 # inode（一个根是另一个的软链，2026-11-05 起双根同实体）。
@@ -2364,6 +2416,7 @@ REFLECTION_RULES = "## 知识库记录与维护\n\n" + REFLECTION_CONTENT_POLICY
 
 
 def register_write(ctx: Any) -> None:
+    _install_tool_verbs()
     _patch_toolsets_core()
     _patch_sop_fork()
     _patch_review_notify_tools()
