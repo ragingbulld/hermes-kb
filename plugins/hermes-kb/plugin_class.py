@@ -1566,6 +1566,10 @@ class KBAutoInjectPlugin:
         if not sid or not tid:
             logger.debug("[KBAutoInject] read-mark skip: no turn_id (%s)", tool_name)
             return
+        # 键必须由 `_turn_key` 生成，不要在这里手拼 `f"{sid}:{tid}"`：
+        # 手拼等于把「两边格式一致」变成隐式契约 —— `_turn_key` 哪天改格式，
+        # 这里不会跟着改，已读跳过会静默失效且没有任何日志报错。
+        tk = self._turn_key({"session_id": sid, "turn_id": tid})
         raw = str(args.get("path") or "").strip()
         if not raw:
             return
@@ -1583,7 +1587,7 @@ class KBAutoInjectPlugin:
 
         marked = 0
         with self._turn_lock:
-            hits = self._ladder.get(f"{sid}:{tid}")
+            hits = self._ladder.get(tk)
             if not hits:
                 return
             for rec in hits.values():
