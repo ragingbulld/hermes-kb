@@ -113,12 +113,27 @@ class KBAutoInjectPlugin:
     # 把**检索成本已经付掉**的清单悄悄丢掉（dropped 记账只留一个数字，看不出丢了什么）。
     # 既然全投，槽在每次请求后必空，积压上限与 dropped 记账一起失去意义。
     # owner 2026-11-26：「合并注入限制删干净优雅点」。
+    #
+    # 阶梯投递（owner 2026-11-28 定）：**阶段点是「间隔」，而且间隔按倍数延长**。
+    # 第一次命中就投；投完清零，再攒 3 次投；再清零，攒 10 次投；之后 30、100、300…
+    # 命中序号上是 1、4、14、44、144、444…（间距 ≈×3，越往后越稀）。
+    # owner 原话：「第一次命中 1 了然后清理计数器继续下一个 3，到了又清空再到 10，
+    #   相当于阶段点其实是间隔」+「还是倍数不要你那个几何」。
+    # 注意：**这里存的是间隔，不是命中序号** —— 上一版把同一串数当序号用
+    # （`n in (1,3,10)`）是错的，那等于「第 1/3/10 次命中」，不是「隔 1/3/10 次」。
+    _HIT_GAPS = (1, 3, 10, 30, 100, 300)
+
+    # `_ladder` 里的哨兵：本轮这张卡**已经被真读过正文** → 本轮不再投。
+    # 用同一个 dict 的另一个值域表达，不新开一张「已读账」（owner: 优雅点）。
+    _READ = -1
+
     def __init__(self):
         # 类型注解用 Any：KBEngine 已改为惰性导入，运行时不再求值该符号
         self._engine: Optional[Any] = None
         self._engine_lock = threading.Lock()
         self._turn_lock = threading.RLock()
-        # 协议段「每 turn 只发一次」的记账 —— 本插件唯一保留的 turn 状态。
+        # 协议段「每 turn 只发一次」的记账。`_ladder`（阶梯投递的命中计数）
+        # 与它同形、同一个 turn_key 口径，两处共用 `_max_turn_states` 做 LRU 裁剪。
         self._turns: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._max_turn_states = 128
         # ---------------- 全部状态：一次待投递的清单 ----------------
@@ -132,6 +147,15 @@ class KBAutoInjectPlugin:
         # 拿到结构才能把同一张卡的命中落点并成一棵树。渲染统一在出口那一次做。
         self._pending: Dict[str, List[Tuple[int, str, List[Dict[str, Any]]]]] = {}
         self._pending_lock = threading.Lock()
+        # 阶梯记账：turn_key -> {卡key: 记录}。**与 `_turns` 同形、同一个 turn_key
+        # 口径** —— 换 turn 天然就是一张新表，不需要第二个轮次管理器。
+        # 记录 = [命中次数, 绝对路径, 起行, 行数, 区间是否精确]：
+        #   · 前一项定节奏（阶梯），后四项定「读的是不是这张卡」。
+        #   两件事共用同一条记录，所以已读判定是纯内存比较，不扫历史、不查骨架。
+        # 记的是「命中几次」而不是「发过没有」：没有能力永久压制一张卡，
+        # 第 2 次静默，第 4 次、第 14 次照样再送。
+        # 命中次数为 `_READ`(-1) = 本轮已读过正文，不再投；换 turn 就作废。
+        self._ladder: "OrderedDict[str, Dict[str, list]]" = OrderedDict()
         # kb_query 的后台检索池：只跑 retrieve（慢的网络段）。**跑完当场回调**
         # `_on_job_done` 把清单塞进待投递槽 —— 池子里没有「等人来取」的成品。
         self._async_pool = KBAsyncPool(
@@ -694,6 +718,10 @@ class KBAutoInjectPlugin:
             if _h1:
                 _sp = self._chain_spans(fp, [_h1]) or [(0, 0, 0)]
                 _, _cs, _cl = _sp[0]
+            # 区间是不是**这张卡自己**的：只有 H1 真定位到了才算。定位失败会退化成
+            # 整文件区间，而一文件多卡时那等于「读了任意一行 → 同文件所有卡都算读过」
+            # —— 静默漏投，方向不安全。记下精确性，已读判定只认精确区间。
+            _span_exact = bool(_cs)
             if not _cs:
                 _cs, _cl = 1, self._file_lines(fp)
             menu.append({
@@ -708,6 +736,8 @@ class KBAutoInjectPlugin:
                 # card_start 是它在文件里的起始行，渲染层拼成「行 a~b」。
                 "total_lines": _cl,
                 "card_start": _cs,
+                # False = 上面那两个数是整文件兜底，不是这张卡自己的范围。
+                "span_exact": _span_exact,
                 # 绝对路径：read_file 的唯一入口
                 "path": fp,
                 # 原始首段（未归一）。兜底时要区分「假 H1」和「文件名回退」：
@@ -1380,6 +1410,9 @@ class KBAutoInjectPlugin:
         加的是返回 JSON 里的一个新字段 `kb_card`，**`content` 一个字不碰**：
         content 每行带 `行号|` 前缀，往里插一行会让后面所有行号错位。
         """
+        # 先记「这张卡本轮读过了」—— 与下面挂时间戳是两件事、互不依赖：
+        # 时间戳拿不到（小文件没坐标）也不该影响已读记账。
+        self._mark_read(tool_name, args, **kwargs)
         if tool_name != "read_file" or not isinstance(result, str):
             return None
         # 工具自己失败了（文件不存在 / 权限 / 目录），读到的不可能是正文。
@@ -1413,7 +1446,16 @@ class KBAutoInjectPlugin:
     def handle_llm_request(
         self, request: Any = None, session_id: str = "", **kwargs: Any
     ) -> Optional[Dict[str, Any]]:
-        """每次模型调用前，把攒下的清单贴到最后一条消息尾部。**不进历史**。
+        """每次模型调用前，把攒下的清单**按阶梯**贴到最后一条消息尾部。**不进历史**。
+
+        阶梯（**间隔口径**）：第一次命中就投；投完清零，再攒 3 次投；再清零，攒 10 次
+        投；之后 30、100、300… —— 命中序号上是 1、4、14、44、144、444…。其余次数只
+        推进计数、不贴，既压掉「同一张卡连着贴两遍」，也保证每张卡在本轮里始终有回来的
+        节奏。
+
+        **本轮已经读过正文的卡直接不投**：标记不在这层做 —— `transform_tool_result`
+        钩子在读取发生的那一刻就把那张卡记成 `_READ`（`_mark_read`）。这里只认一个
+        事实，不扫历史、不问模型。换 turn 就是新表，标记自动作废。
 
         核心（`hermes_cli/middleware.py: apply_llm_request_middleware`）把请求
         `_safe_copy` 之后交进来，改的是副本，替换 `api_kwargs` 只对这一次调用
@@ -1423,38 +1465,176 @@ class KBAutoInjectPlugin:
         if not isinstance(request, dict):
             return None
         _sid = session_id or "default"
+        # `_turn_key` 内部是从 kwargs 取 session_id 的（`handle_pre_llm_call` 那边
+        # 它本来就在 kwargs 里）。这里 session_id 是独立形参，不并进去会退化成
+        # `default:<turn_id>`，多会话共用同一个前缀。
+        _tk = self._turn_key({**kwargs, "session_id": _sid}, request.get("messages"))
         with self._pending_lock:
             _slot = self._pending.get(_sid)
             if not _slot:
                 return None
-            # 按「检索词在提示词里的位置」排，位置相同再按提交序号兜底。
-            # 不按完成时间、也不单独按提交序号：并行段里两者都会错位。
-            # 排序只决定拼接顺序（越新越靠后），不再用来截断。
-            _slot.sort(key=lambda item: (self._prompt_rank(request, item[1]), item[0]))
-            # 槽里攒了多少就投多少：检索成本已经付过，没有理由再按「批数」筛一遍。
-            # 全投 ⇒ 槽每次请求后必空，积压与丢弃这两个概念一并消失。
+            # 计数必须按**提交序号**推进：一次请求可能同时取到好几批，若照渲染
+            # 顺序走，「第 3 次命中」就会错位。渲染顺序在下面另排一次。
+            _slot.sort(key=lambda item: item[0])
             _take = list(_slot)
             _slot.clear()
             self._pending.pop(_sid, None)
-        # 多批 → 一屏。同一张卡在两批里各命中一次时，这里合并成一行一棵树：
-        # `_build_menu` 只能在**单批内**去重（批与批互相看不见），而批数闸删掉后
-        # 一次可能投十几批，同一张卡重复出现的概率反而变高。
-        _merged = self._merge_menus([m for _, _, mm in _take for m in mm])
-        _block = self._render_menu(_merged)
+
+        with self._turn_lock:
+            # 深拷贝：值是可变记录（含命中次数），浅拷贝会让「贴失败不记账」变成空话
+            # —— 失败回退的批会把已加过的次数留在共享对象上。
+            _hits = {k: list(v) for k, v in (self._ladder.get(_tk) or {}).items()}
+
+        _emit: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        _skipped = 0
+        for _, _q, _menu in _take:
+            # `_build_menu` 的产物已经是一张卡一条，单批内不必再合并。
+            for _item in _menu:
+                _key = str(_item.get("key") or _item.get("title") or "")
+                if not _key:
+                    continue
+                # 记录 = [命中次数, 路径, 起行, 行数, 区间是否精确]。
+                # 本轮第一次见到这张卡时把判定材料一并存下 —— `transform_tool_result`
+                # 那边标记已读就纯内存比区间，不必回头查文件骨架、更不必扫历史。
+                rec = _hits.get(_key)
+                if rec is None:
+                    rec = _hits[_key] = [
+                        0,
+                        os.path.abspath(
+                            os.path.expanduser(str(_item.get("path") or ""))
+                        ),
+                        int(_item.get("card_start") or 1),
+                        int(_item.get("total_lines") or 1),
+                        bool(_item.get("span_exact", True)),
+                    ]
+                if rec[0] == self._READ:
+                    # 本轮读过正文了，这一屏不再给它位置。
+                    _skipped += 1
+                    continue
+                rec[0] += 1
+                if self._is_hit_point(rec[0]):
+                    # 同一请求里两批都踩到阶梯点 → 只渲染一次，取最后一次的落点。
+                    _emit[_key] = (_q, _item)
+
+        if not _emit:
+            # 全是静默档：只推进计数，这次请求一个字都不贴。
+            self._commit_ladder(_tk, _hits)
+            if _skipped:
+                logger.info(
+                    "[KBAutoInject] llm_request READ-SKIP skip=%d sid=%s",
+                    _skipped, _sid[:26],
+                )
+            return None
+
+        _items = list(_emit.values())
+        _items.sort(key=lambda pair: self._prompt_rank(request, pair[0]))
+        _block = self._render_menu([m for _, m in _items])
         if not _append_to_last_message(request, _block):
             # 没拼进去就放回槽，下次还有机会 —— 注入失败不等于这批数据作废。
             with self._pending_lock:
                 self._pending.setdefault(_sid, []).extend(_take)
             return None
+        self._commit_ladder(_tk, _hits)
         logger.info(
-            "[KBAutoInject] llm_request INJECT batches=%d cards=%d chars=%d sid=%s",
-            len(_take), len(_merged), len(_block), _sid[:26],
+            "[KBAutoInject] llm_request INJECT batches=%d emit=%d read_skip=%d chars=%d sid=%s",
+            len(_take), len(_items), _skipped, len(_block), _sid[:26],
         )
         return {
             "request": request,
             "name": "hermes-kb-auto-inject",
-            "reason": "kb titles tail inject",
+            "reason": "kb titles tail inject (ladder)",
         }
+
+    def _mark_read(self, tool_name: str, args: Any = None, **kwargs: Any) -> None:
+        """读取发生的那一刻就记账：这张卡本轮读过了。
+
+        不扫历史、不问模型 —— `transform_tool_result` 是工具返回的必经之路，
+        在这里记的是既成事实。`_ladder` 里每条记录自带这张卡的行区间
+        `[命中次数, 路径, 起行, 行数, 区间是否精确]`，所以判定是纯内存 O(本轮卡数)。
+
+        `turn_key` 由钩子自带的 `session_id` + `turn_id` 拼，与
+        `handle_llm_request` 的 `_turn_key` 同格式。**缺 turn_id 时直接返回**：
+        勾子没有 messages，算不出 content-hash 兜底键，硬拼出来的 key 两边对不上，
+        记了也是白记 —— 那种情况下已读跳过不生效，但绝不误标。
+        """
+        if tool_name != "read_file" or not isinstance(args, dict):
+            return
+        if str(kwargs.get("status") or "ok").strip().lower() != "ok":
+            return
+        sid = str(kwargs.get("session_id") or "")
+        tid = str(kwargs.get("turn_id") or "")
+        if not sid or not tid:
+            logger.debug("[KBAutoInject] read-mark skip: no turn_id (%s)", tool_name)
+            return
+        raw = str(args.get("path") or "").strip()
+        if not raw:
+            return
+        try:
+            start = args.get("offset")
+            start = int(start) if start not in (None, "") else 1
+            size = args.get("limit")
+            size = int(size) if size not in (None, "") else 2000
+        except (TypeError, ValueError):
+            start, size = 1, 2000
+        if start < 1 or size < 1:
+            return
+        path = os.path.abspath(os.path.expanduser(raw))
+        lo, hi = start, start + size - 1
+
+        marked = 0
+        with self._turn_lock:
+            hits = self._ladder.get(f"{sid}:{tid}")
+            if not hits:
+                return
+            for rec in hits.values():
+                # rec = [命中次数, 路径, 起行, 行数, 区间是否精确]
+                if rec[0] == self._READ:
+                    continue
+                if not rec[4] or rec[1] != path:
+                    continue
+                card_lo = rec[2]
+                card_hi = card_lo + max(1, rec[3]) - 1
+                if lo <= card_hi and hi >= card_lo:
+                    rec[0] = self._READ
+                    marked += 1
+        if marked:
+            # 低频（只有真读卡才触发），而且这是「钩子这条链活着」的唯一线上证据。
+            logger.info(
+                "[KBAutoInject] read-mark %d card(s) %s", marked, raw,
+            )
+
+    def _is_hit_point(self, n: int) -> bool:
+        """本轮第 *n* 次命中该不该投递。
+
+        `_HIT_GAPS` 是**间隔**：1、3、10、30、100、300…，累加成投递点
+        1、4、14、44、144、444…。走完全部间隔后按最后一个间隔重复，
+        所以再长的 turn 也不会把某张卡彻底压死。
+        """
+        prev = 0
+        for gap in self._HIT_GAPS:
+            prev += gap
+            if n == prev:
+                return True
+        return n > prev and (n - prev) % self._HIT_GAPS[-1] == 0
+
+    def _commit_ladder(self, turn_key: str, hits: Dict[str, list]) -> None:
+        """写回本轮记录（只在贴成功之后调）。换 turn 是新 key，旧表交给 LRU 裁掉。
+
+        `_READ` 是终态：本次请求的快照可能比钩子晚一拍，合并时不让它把「已读过」
+        覆盖回「没读过」—— 否则同一张卡会被重复贴一遍。
+        """
+        with self._turn_lock:
+            cur = self._ladder.get(turn_key)
+            if cur is None:
+                self._ladder[turn_key] = hits
+            else:
+                for _k, _rec in hits.items():
+                    if (cur.get(_k) or [0])[0] == self._READ:
+                        continue
+                    cur[_k] = _rec
+            self._ladder.move_to_end(turn_key)
+            while len(self._ladder) > self._max_turn_states:
+                self._ladder.popitem(last=False)
 
     def handle_pre_llm_call(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
 
